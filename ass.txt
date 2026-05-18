@@ -1,0 +1,21 @@
+任务B：Vision Transformer (ViT) 用于图像分类任务
+背景
+图像分类是计算机视觉领域的核心任务之一，传统方法如卷积神经网络（CNN）在该任务上取得了显著成功。然而，近年来，基于Transformer的视觉模型（如Vision Transformer, ViT）逐渐展现出强大的性能，尤其是在大规模数据集上的表现优于传统CNN模型。本大作业旨在探索ViT在图像分类任务中的应用，并评估其性能。
+说明
+模型
+1.	基础模型：使用标准的Vision Transformer (ViT)模型，将图像分割为固定大小的patch，并将这些patch线性嵌入后输入Transformer编码器进行特征提取。
+2.	改进模型：可以尝试对ViT进行改进，例如引入混合模型（Hybrid Model），即先用ResNet提取局部特征，再用ViT进行全局特征提取。
+数据集
+1.	数据集选择：使用公开的图像分类数据集，例如CIFAR-10或Tiny ImageNet。
+2.	数据预处理：对图像进行标准化处理，并将其划分为训练集、验证集和测试集。
+基本要求
+1.	实现一个基于Vision Transformer (ViT)的图像分类模型。
+2.	使用所选择的数据集进行训练和测试，并记录模型的分类准确率（Accuracy）及其他评估指标（如Top-1/Top-5准确率）。
+3.	对比ViT模型与传统CNN模型（如ResNet）的性能差异。
+Bonus要求
+1.	尝试对ViT模型进行改进，例如引入数据增强技术（如MixUp、RandAugment）或正则化方法（如Stochastic Depth、Dropout）以提升模型性能。
+2.	进行超参数调优（如patch大小、层数、头数等）并分析其对模型性能的影响。
+参考论文
+1.	Dosovitskiy et al, "An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale"
+2.	Steiner et al, "How to train your ViT? Data, Augmentation, and Regularization in Vision Transformers"
+

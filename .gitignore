@@ -1,0 +1,34 @@
+# Data
+data/
+*.pth
+*.pt
+*.pkl
+*.ckpt
+
+# Results and plots
+*.png
+*.jpg
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
