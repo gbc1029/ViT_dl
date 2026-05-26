@@ -1,6 +1,6 @@
 """Configuration for ResNet on CIFAR-10"""
 
-class ResNetConfig:
+class Config:
     # Model parameters
     num_classes = 10
     model_type = 'resnet18'  # 'resnet18' or 'resnet34'
