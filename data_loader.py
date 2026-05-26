@@ -37,18 +37,18 @@ def get_cifar10_dataloaders(batch_size=64, num_workers=4, data_dir='./data'):
         transforms.Normalize(mean, std)
     ])
     
-    # Download and load datasets
+    # Load datasets (download=False since data already exists)
     train_dataset = CIFAR10(
         root=data_dir, 
         train=True, 
-        download=True, 
+        download=False, 
         transform=train_transform
     )
     
     test_dataset = CIFAR10(
         root=data_dir, 
         train=False, 
-        download=True, 
+        download=False, 
         transform=test_transform
     )
     
