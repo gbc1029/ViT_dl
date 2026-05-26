@@ -1,23 +1,20 @@
-"""Configuration for ViT on CIFAR-10"""
+"""Configuration for ResNet on CIFAR-10"""
 
-class Config:
+class ResNetConfig:
     # Model parameters
-    image_size = 32
-    patch_size = 4
     num_classes = 10
-    dim = 512
-    depth = 6
-    heads = 8
-    mlp_dim = 512
-    dropout = 0.1
-    emb_dropout = 0.1
+    model_type = 'resnet18'  # 'resnet18' or 'resnet34'
     
     # Training parameters
-    batch_size = 64
-    num_epochs = 30
-    learning_rate = 3e-4
-    weight_decay = 0.03
-    warmup_epochs = 5
+    batch_size = 128
+    num_epochs = 200  # ResNet needs more epochs
+    learning_rate = 0.1
+    momentum = 0.9
+    weight_decay = 5e-4
+    
+    # Learning rate milestones for MultiStepLR
+    lr_milestones = [100, 150]
+    lr_gamma = 0.1
     
     # Data parameters
     num_workers = 4
