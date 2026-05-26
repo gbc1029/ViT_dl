@@ -24,3 +24,7 @@ class Config:
     
     # Device
     device = 'cuda'
+    
+    # Training mode
+    mode = 'train'  # Options: 'dry_run', 'train', 'test', 'resume'
+    checkpoint_path = None  # Path to checkpoint for test or resume

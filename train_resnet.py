@@ -6,14 +6,67 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
 import argparse
+import os
+from datetime import datetime
 
-from cnn_model import ResNet18
+from cnn_model import ResNet18, ResNet34
 from data_loader import get_cifar10_dataloaders
 from config_resnet import ResNetConfig
-from train_utils import (
-    save_checkpoint, load_checkpoint, 
-    evaluate_model, test_all_classes
-)
+
+
+def get_timestamp_filename(base_name, ext='pth'):
+    """Generate filename with timestamp."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return f"{base_name}_{timestamp}.{ext}"
+
+
+def save_checkpoint(model, optimizer, scheduler, history, config, filename='checkpoint.pth'):
+    """Save model checkpoint with timestamp."""
+    save_dir = 'checkpoints'
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Add timestamp to filename
+    save_path = os.path.join(save_dir, get_timestamp_filename(filename.replace('.pth', '')))
+    
+    # Prepare checkpoint dict
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'history': history,
+        'config': config.__dict__
+    }
+    
+    # Add scheduler if exists
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+    
+    torch.save(checkpoint, save_path)
+    print(f"Checkpoint saved to: {save_path}")
+    return save_path
+
+
+def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, device='cuda'):
+    """Load model checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load optimizer state if provided
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print("Optimizer state loaded")
+    
+    # Load scheduler state if provided
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print("Scheduler state loaded")
+    
+    history = checkpoint.get('history', {})
+    config = checkpoint.get('config', {})
+    
+    print(f"Checkpoint loaded from: {checkpoint_path}")
+    return {'history': history, 'config': config}
 
 
 class ResNetTrainer:
@@ -254,17 +307,26 @@ def test_mode(config):
     )
     
     # Evaluate
+    model.eval()
+    test_loss = 0.0
+    correct = 0
+    total = 0
     criterion = nn.CrossEntropyLoss()
-    results = evaluate_model(model, test_loader, criterion, device)
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            test_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
     
     print(f"\nTest Results:")
-    print(f"  Loss: {results['loss']:.4f}")
-    print(f"  Accuracy: {results['accuracy']:.2f}%")
-    print(f"  Correct: {results['correct']}/{results['total']}")
-    
-    # Show per-class accuracy
-    class_names = test_loader.dataset.classes
-    confusion_matrix = test_all_classes(model, test_loader, class_names, device)
+    print(f"  Loss: {test_loss / len(test_loader):.4f}")
+    print(f"  Accuracy: {100. * correct / total:.2f}%")
+    print(f"  Correct: {correct}/{total}")
 
 
 def parse_args():
