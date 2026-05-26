@@ -1,5 +1,7 @@
 # Data
 data/
+checkpoints/
+checkpoints*
 *.pth
 *.pt
 *.pkl

@@ -14,19 +14,14 @@ from data_loader import get_cifar10_dataloaders
 from config import Config
 
 
-def get_timestamp_filename(base_name, ext='pth'):
-    """Generate filename with timestamp."""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    return f"{base_name}_{timestamp}.{ext}"
-
-
-def save_checkpoint(model, optimizer, scheduler, history, config, filename='checkpoint.pth'):
+def save_checkpoint(model, optimizer, scheduler, history, config, filename='checkpoint'):
     """Save model checkpoint with timestamp."""
     save_dir = 'checkpoints'
     os.makedirs(save_dir, exist_ok=True)
     
     # Add timestamp to filename
-    save_path = os.path.join(save_dir, get_timestamp_filename(filename.replace('.pth', '')))
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    save_path = os.path.join(save_dir, f"{filename}_{timestamp}.pth")
     
     # Prepare checkpoint dict
     checkpoint = {
@@ -103,23 +98,44 @@ class Trainer:
             weight_decay=config.weight_decay
         )
         
-        # Learning rate scheduler with warmup
-        warmup_scheduler = LinearLR(
-            self.optimizer, 
-            start_factor=0.01, 
-            end_factor=1.0, 
-            total_iters=len(self.train_loader) * config.warmup_epochs
-        )
-        cosine_scheduler = CosineAnnealingLR(
-            self.optimizer, 
-            T_max=len(self.train_loader) * (config.num_epochs - config.warmup_epochs)
-        )
-        
-        self.scheduler = optim.lr_scheduler.SequentialLR(
-            self.optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[len(self.train_loader) * config.warmup_epochs]
-        )
+        # Learning rate scheduler with optional warmup
+        n_batches = len(self.train_loader)
+
+        # If warmup_epochs is positive and strictly less than total epochs, use SequentialLR
+        if getattr(config, 'warmup_epochs', 0) and config.warmup_epochs < config.num_epochs:
+            warmup_iters = n_batches * config.warmup_epochs
+            cosine_iters = n_batches * (config.num_epochs - config.warmup_epochs)
+
+            # Ensure cosine_iters is at least 1 to avoid ZeroDivisionError in CosineAnnealingLR
+            if cosine_iters <= 0:
+                cosine_iters = 1
+
+            warmup_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=0.01,
+                end_factor=1.0,
+                total_iters=warmup_iters
+            )
+
+            cosine_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=cosine_iters
+            )
+
+            self.scheduler = optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_iters]
+            )
+        else:
+            # No warmup (either warmup_epochs == 0 or >= num_epochs): use single cosine scheduler
+            if getattr(config, 'warmup_epochs', 0) >= config.num_epochs and config.num_epochs > 0:
+                print("Warning: warmup_epochs >= num_epochs — disabling warmup and using cosine schedule for all epochs.")
+
+            total_iters = n_batches * max(1, config.num_epochs)
+            # Ensure T_max >= 1
+            T_max = max(1, total_iters)
+            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=T_max)
         
         # Training history
         self.history = {
@@ -146,20 +162,18 @@ class Trainer:
         # Test one batch
         images, labels = next(iter(self.train_loader))
         images, labels = images.to(self.device), labels.to(self.device)
+        print(f"Batch loaded successfully! Images shape: {images.shape}, Labels shape: {labels.shape}")
         
         # Forward pass
         outputs = self.model(images)
         loss = self.criterion(outputs, labels)
+        print(f"Forward pass successful! Loss: {loss.item():.4f}")
         
         # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        
-        print(f"Dry run successful!")
-        print(f"  Loss: {loss.item():.4f}")
-        print(f"  Image shape: {images.shape}")
-        print(f"  Output shape: {outputs.shape}")
+        print("Backward pass successful! Weights updated.")
         
         # Test one forward pass
         self.model.eval()
@@ -167,7 +181,7 @@ class Trainer:
             outputs = self.model(images)
             _, predicted = outputs.max(1)
             accuracy = (predicted == labels).sum().item() / labels.size(0)
-            print(f"  Accuracy: {100 * accuracy:.2f}%")
+            print(f"eval pass successful! Accuracy on batch: {100 * accuracy:.2f}%")
     
     def train_epoch(self, epoch):
         """Train for one epoch."""
@@ -204,7 +218,6 @@ class Trainer:
                 'lr': f'{current_lr:.2e}'
             })
         
-        self.scheduler.step()
         avg_loss = train_loss / len(self.train_loader)
         avg_acc = 100. * correct / total
         
@@ -239,18 +252,7 @@ class Trainer:
         self.history['test_acc'].append(avg_acc)
         
         return avg_loss, avg_acc
-    
-    def save_model(self, path='vit_cifar10.pth', save_final=True):
-        """Save model checkpoint."""
-        path = save_checkpoint(
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.history,
-            self.config,
-            filename=path
-        )
-        return path
+
     
     def train(self):
         """Main training loop."""
@@ -281,10 +283,24 @@ class Trainer:
             # Save best model
             if test_acc > best_acc:
                 best_acc = test_acc
-                self.save_model('vit_cifar10_best.pth', save_final=False)
+                save_checkpoint(
+                    self.model,
+                    self.optimizer,
+                    self.scheduler,
+                    self.history,
+                    self.config,
+                    filename='vit_cifar10_best'
+                )
         
         # Save final model
-        self.save_model('vit_cifar10_final.pth')
+        save_checkpoint(
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            self.history,
+            self.config,
+            filename='vit_cifar10_final'
+        )
         
         print(f"\nTraining completed! Best test accuracy: {best_acc:.2f}%")
 
@@ -362,6 +378,14 @@ def parse_args():
 
 
 if __name__ == "__main__":
+
+    print(f"PyTorch版本: {torch.__version__}")
+    print(f"CUDA是否可用: {torch.cuda.is_available()}")
+    print(f"CUDA版本: {torch.version.cuda}")
+    print(f"GPU数量: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        print(f"当前GPU: {torch.cuda.get_device_name(0)}")
+        
     args = parse_args()
     config = Config()
     
