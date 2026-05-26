@@ -28,7 +28,14 @@ def save_checkpoint(model, optimizer, scheduler, history, config, filename='chec
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'history': history,
-        'config': config.__dict__
+        'config': config.__dict__,
+        'random_states': {
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            'np': np.random.get_state(),
+            'random': random.getstate(),
+        },
+        'saved_fields': [k for k in config.__dict__.keys() if k in ['warmup_epochs', 'device', 'batch_size', 'learning_rate', 'weight_decay', 'num_epochs', 'num_workers']],
     }
     
     # Add scheduler if exists
@@ -36,12 +43,42 @@ def save_checkpoint(model, optimizer, scheduler, history, config, filename='chec
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
     
     torch.save(checkpoint, save_path)
-    print(f"Checkpoint saved to: {save_path}")
+    _log_info(f"Checkpoint saved to: {save_path}")
     return save_path
+
+
+def get_latest_checkpoint():
+    """Get the latest checkpoint file."""
+    save_dir = 'checkpoints'
+    if not os.path.exists(save_dir):
+        return None
+    
+    checkpoints = glob.glob(f"{save_dir}/*.pth")
+    if not checkpoints:
+        return None
+    
+    # Sort by modification time (descending)
+    checkpoints = sorted(checkpoints, key=os.path.getmtime, reverse=True)
+    return checkpoints[0]
 
 
 def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, device='cuda'):
     """Load model checkpoint."""
+    # Auto-select latest if path is None
+    if checkpoint_path is None:
+        latest = get_latest_checkpoint()
+        if latest:
+            _log_info(f"No checkpoint path specified, using latest: {latest}")
+            checkpoint_path = latest
+        else:
+            raise FileNotFoundError("No checkpoint found in checkpoints directory")
+    
+    # Check if file exists
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    _log_info(f"Loading checkpoint from: {checkpoint_path}")
+    
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Load model state
@@ -50,18 +87,31 @@ def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, devi
     # Load optimizer state if provided
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print("Optimizer state loaded")
+        _log_info("Optimizer state loaded")
     
     # Load scheduler state if provided
     if scheduler is not None and 'scheduler_state_dict' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        print("Scheduler state loaded")
+        _log_info("Scheduler state loaded")
+    
+    # Restore random states
+    if 'random_states' in checkpoint:
+        random_states = checkpoint['random_states']
+        torch.set_rng_state(random_states['torch'])
+        if random_states['cuda'] is not None:
+            torch.cuda.set_rng_state_all(random_states['cuda'])
+        np.random.set_state(random_states['np'])
+        random.setstate(random_states['random'])
+        _log_info("Random states restored")
     
     history = checkpoint.get('history', {})
-    config = checkpoint.get('config', {})
+    config_dict = checkpoint.get('config', {})
     
-    print(f"Checkpoint loaded from: {checkpoint_path}")
-    return {'history': history, 'config': config}
+    # Show saved fields
+    saved_fields = checkpoint.get('saved_fields', [])
+    _log_info(f"Checkpoint contains {len(saved_fields)} saved fields: {saved_fields}")
+    
+    return {'history': history, 'config': config_dict}
 
 
 class Trainer:
@@ -69,7 +119,15 @@ class Trainer:
     
     def __init__(self, config):
         self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
+        
+        # Save random states before creating data loaders
+        self.random_states = {
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            'np': np.random.get_state(),
+            'random': random.getstate(),
+        }
         
         # Model
         self.model = VisionTransformer(
@@ -130,7 +188,7 @@ class Trainer:
         else:
             # No warmup (either warmup_epochs == 0 or >= num_epochs): use single cosine scheduler
             if getattr(config, 'warmup_epochs', 0) >= config.num_epochs and config.num_epochs > 0:
-                print("Warning: warmup_epochs >= num_epochs — disabling warmup and using cosine schedule for all epochs.")
+                _log_info(f"Warning: warmup_epochs ({config.warmup_epochs}) >= num_epochs ({config.num_epochs}) — disabling warmup and using cosine schedule for all epochs.")
 
             total_iters = n_batches * max(1, config.num_epochs)
             # Ensure T_max >= 1
@@ -146,13 +204,45 @@ class Trainer:
         }
         
         # Resume from checkpoint if specified
-        if config.checkpoint_path and config.mode == 'resume':
-            loaded_data = load_checkpoint(
-                self.model, config.checkpoint_path,
-                self.optimizer, self.scheduler, self.device
-            )
-            self.history = loaded_data.get('history', self.history)
-            print(f"Resumed from epoch {len(self.history['train_loss'])}")
+        if config.mode == 'resume':
+            if config.checkpoint_path is None:
+                _log_info("Resume mode but no checkpoint path specified, trying to find latest...")
+                config.checkpoint_path = get_latest_checkpoint()
+            
+            if config.checkpoint_path:
+                loaded_data = load_checkpoint(
+                    self.model, config.checkpoint_path,
+                    self.optimizer, self.scheduler, self.device
+                )
+                self.history = loaded_data.get('history', self.history)
+                _log_info(f"Resumed from epoch {len(self.history['train_loss'])}")
+            else:
+                raise RuntimeError("Resume mode requires checkpoint, but none found")
+    
+    def check_convergence(self, epoch, test_acc):
+        """Double convergence check: accuracy + parameter changes."""
+        # Check 1: Accuracy improvement
+        if len(self.history['test_acc']) >= self.config.convergence_patience:
+            recent_acc = self.history['test_acc'][-self.config.convergence_patience:]
+            improvement = max(recent_acc) - min(recent_acc)
+            
+            if improvement < self.config.convergence_threshold:
+                _log_info(f"Accuracy convergence detected: {improvement:.4f} < {self.config.convergence_threshold}")
+                _log_info(f"Last {self.config.convergence_patience} epochs accuracy: min={min(recent_acc):.2f}%, max={max(recent_acc):.2f}%")
+                return True
+        
+        # Check 2: Parameter change (using parameter L2 distance)
+        if len(self.history['train_loss']) > 1:
+            prev_loss = self.history['train_loss'][-2]
+            curr_loss = self.history['train_loss'][-1]
+            loss_change = abs(curr_loss - prev_loss)
+            
+            if loss_change < self.config.param_change_threshold:
+                _log_info(f"Loss convergence detected: {loss_change:.6f} < {self.config.param_change_threshold}")
+                _log_info(f"Previous loss: {prev_loss:.4f}, Current loss: {curr_loss:.4f}")
+                return True
+        
+        return False
     
     def dry_run(self):
         """Dry run: quick test to verify everything works."""
@@ -256,33 +346,61 @@ class Trainer:
     
     def train(self):
         """Main training loop."""
-        print(f"Training on device: {self.device}")
-        print(f"Model: Vision Transformer")
-        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()) / 1e6:.2f}M")
-        print(f"Training samples: {len(self.train_loader.dataset)}")
-        print(f"Test samples: {len(self.test_loader.dataset)}")
+        _log_info(f"Training on device: {self.device}")
+        _log_info(f"Model: Vision Transformer")
+        _log_info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()) / 1e6:.2f}M")
+        _log_info(f"Training samples: {len(self.train_loader.dataset)}")
+        _log_info(f"Test samples: {len(self.test_loader.dataset)}")
+        _log_info(f"Initial learning rate: {self.config.learning_rate}")
+        _log_info(f"Batch size: {self.config.batch_size}")
+        _log_info(f"Warmup epochs: {self.config.warmup_epochs}")
         
         best_acc = 0.0
+        patience_counter = 0
         
         # If resuming, start from current epoch
         start_epoch = len(self.history['train_loss'])
         
+        _log_info(f"Starting training from epoch {start_epoch + 1} to {self.config.num_epochs}")
+        
         for epoch in range(start_epoch, self.config.num_epochs):
+            _log_info(f"\n{'='*60}")
+            _log_info(f"Epoch {epoch+1}/{self.config.num_epochs}")
+            _log_info(f"{'='*60}")
+            
             # Train
             train_loss, train_acc = self.train_epoch(epoch)
             
             # Evaluate
             test_loss, test_acc = self.evaluate()
             
-            # Print summary
-            print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
-            print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
-            print("-" * 50)
+            _log_info(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            _log_info(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
+            
+            # Check convergence
+            if self.check_convergence(epoch, test_acc):
+                _log_info(f"Early stopping: Training converged at epoch {epoch+1}")
+                _log_info(f"Final test accuracy: {test_acc:.2f}%")
+                _log_info(f"Best test accuracy: {best_acc:.2f}%")
+                break
+            
+            # Check patience
+            if test_acc > best_acc:
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                _log_info(f"Convergence patience counter: {patience_counter}/{self.config.convergence_patience}")
+            
+            if patience_counter >= self.config.convergence_patience:
+                _log_info(f"Early stopping: No improvement for {self.config.convergence_patience} epochs")
+                _log_info(f"Final test accuracy: {test_acc:.2f}%")
+                _log_info(f"Best test accuracy: {best_acc:.2f}%")
+                break
             
             # Save best model
             if test_acc > best_acc:
                 best_acc = test_acc
+                _log_info(f"New best model! Test accuracy: {best_acc:.2f}%")
                 save_checkpoint(
                     self.model,
                     self.optimizer,
@@ -293,6 +411,9 @@ class Trainer:
                 )
         
         # Save final model
+        _log_info(f"\n{'='*60}")
+        _log_info("Training completed or stopped early")
+        _log_info(f"Best test accuracy: {best_acc:.2f}%")
         save_checkpoint(
             self.model,
             self.optimizer,
@@ -301,21 +422,22 @@ class Trainer:
             self.config,
             filename='vit_cifar10_final'
         )
-        
-        print(f"\nTraining completed! Best test accuracy: {best_acc:.2f}%")
 
 
 def test_mode(config):
     """Test mode: evaluate a saved model."""
-    print("Testing mode...")
+    _log_info("Testing mode...")
     
-    if not config.checkpoint_path:
-        print("Error: checkpoint_path must be specified in test mode")
-        return
+    # Auto-select latest checkpoint if not specified
+    if config.checkpoint_path is None:
+        config.checkpoint_path = get_latest_checkpoint()
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if config.checkpoint_path is None:
+        raise RuntimeError("Test mode requires checkpoint, but none found")
     
-    # Load model
+    device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
+    
+    # Load model (create new instance with same architecture)
     model = VisionTransformer(
         img_size=config.image_size,
         patch_size=config.patch_size,
@@ -331,7 +453,7 @@ def test_mode(config):
     # Load checkpoint
     load_checkpoint(model, config.checkpoint_path, device=device)
     
-    # Get data loaders
+    # Use training time's test_loader
     _, test_loader = get_cifar10_dataloaders(
         batch_size=config.batch_size,
         num_workers=config.num_workers
@@ -358,6 +480,7 @@ def test_mode(config):
     print(f"  Loss: {test_loss / len(test_loader):.4f}")
     print(f"  Accuracy: {100. * correct / total:.2f}%")
     print(f"  Correct: {correct}/{total}")
+    _log_info(f"Test completed! Accuracy: {100. * correct / total:.2f}%")
 
 
 def parse_args():
@@ -367,45 +490,69 @@ def parse_args():
                        choices=['dry_run', 'train', 'test', 'resume'],
                        help='Training mode: dry_run, train, test, resume')
     parser.add_argument('--checkpoint', type=str, default=None,
-                       help='Path to checkpoint file for test or resume mode')
+                       help='Path to checkpoint for test or resume mode')
     parser.add_argument('--epochs', type=int, default=None,
                        help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=None,
                        help='Batch size')
     parser.add_argument('--lr', type=float, default=None,
                        help='Learning rate')
+    parser.add_argument('--warmup-epochs', type=int, default=None,
+                       help='Number of warmup epochs')
+    parser.add_argument('--weight-decay', type=float, default=None,
+                       help='Weight decay')
+    parser.add_argument('--verbose', action='store_true', default=None,
+                       help='Enable verbose logging')
+    parser.add_argument('--debug', action='store_true', default=None,
+                       help='Enable debug logging')
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-
+    
     print(f"PyTorch版本: {torch.__version__}")
     print(f"CUDA是否可用: {torch.cuda.is_available()}")
-    print(f"CUDA版本: {torch.version.cuda}")
-    print(f"GPU数量: {torch.cuda.device_count()}")
     if torch.cuda.is_available():
+        print(f"CUDA版本: {torch.version.cuda}")
+        print(f"GPU数量: {torch.cuda.device_count()}")
         print(f"当前GPU: {torch.cuda.get_device_name(0)}")
         
     args = parse_args()
     config = Config()
     
-    # Override config with command line arguments
-    if args.mode:
+    # Sync command line arguments to Config
+    # Priority: command line > config.py defaults
+    if args.mode is not None:
         config.mode = args.mode
-    if args.checkpoint:
+    if args.checkpoint is not None:
         config.checkpoint_path = args.checkpoint
-    if args.epochs:
+    if args.epochs is not None:
         config.num_epochs = args.epochs
-    if args.batch_size:
+    if args.batch_size is not None:
         config.batch_size = args.batch_size
-    if args.lr:
+    if args.lr is not None:
         config.learning_rate = args.lr
+    if args.warmup_epochs is not None:
+        config.warmup_epochs = args.warmup_epochs
+    if args.weight_decay is not None:
+        config.weight_decay = args.weight_decay
+    if args.verbose is not None:
+        config.verbose = args.verbose
+    if args.debug is not None:
+        config.debug = args.debug
     
     trainer = Trainer(config)
     
     if config.mode == 'dry_run':
         trainer.dry_run()
     elif config.mode == 'test':
+        # Auto-select latest checkpoint if not specified
+        if config.checkpoint_path is None:
+            config.checkpoint_path = get_latest_checkpoint()
+        
+        if config.checkpoint_path is None:
+            raise RuntimeError("Test mode requires checkpoint, but none found")
+        
         test_mode(config)
     else:  # train or resume
         trainer.train()

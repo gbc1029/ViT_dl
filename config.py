@@ -28,3 +28,16 @@ class Config:
     # Training mode
     mode = 'train'  # Options: 'dry_run', 'train', 'test', 'resume'
     checkpoint_path = None  # Path to checkpoint for test or resume
+    
+    # Convergence check (double check)
+    convergence_threshold = 0.001  # Accuracy improvement threshold
+    convergence_patience = 5  # Consecutive epochs without improvement
+    param_change_threshold = 1e-6  # Parameter change threshold
+    
+    # Checkpoint selection (default: auto-select latest if not specified)
+    checkpoint_selection = 'latest'  # 'exact' or 'latest' (for resume/test mode)
+    
+    # Logging control
+    verbose = True  # Enable verbose logging
+    debug = False  # Debug logging (default: off)
+
