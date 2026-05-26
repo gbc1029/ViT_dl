@@ -8,11 +8,15 @@ from tqdm import tqdm
 import argparse
 import os
 from datetime import datetime
-
+from glob import glob
+import numpy as np
+import random
 from model import VisionTransformer
 from data_loader import get_cifar10_dataloaders
 from config import Config
-
+from utils import plot_results, count_parameters, visualize_patches
+from utils import _log_info, _log_debug, _log_warning, _log_error, init_logging, get_logger
+import logging
 
 def save_checkpoint(model, optimizer, scheduler, history, config, filename='checkpoint'):
     """Save model checkpoint with timestamp."""
@@ -62,7 +66,7 @@ def get_latest_checkpoint():
     return checkpoints[0]
 
 
-def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, device='cuda'):
+def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, device=torch.device('cuda')):
     """Load model checkpoint."""
     # Auto-select latest if path is None
     if checkpoint_path is None:
@@ -121,6 +125,66 @@ class Trainer:
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
         
+        # Handle resume mode: restore configuration from checkpoint FIRST
+        if config.mode == 'resume':
+            # Determine checkpoint path
+            if config.checkpoint_path is None:
+                config.checkpoint_path = get_latest_checkpoint()
+                if config.checkpoint_path:
+                    _log_info(f"No checkpoint path specified, using latest: {config.checkpoint_path}")
+            
+            if config.checkpoint_path:
+                # Load checkpoint to get saved configuration (without creating model yet)
+                _log_info(f"Loading checkpoint configuration from: {config.checkpoint_path}")
+                checkpoint = torch.load(config.checkpoint_path, map_location='cpu')
+                saved_config_dict = checkpoint.get('config', {})
+                
+                # Restore saved configuration
+                if saved_config_dict:
+                    _log_info("Restoring configuration from checkpoint:")
+                    restored_fields = []
+                    conflicting_fields = []
+                    
+                    for key, value in saved_config_dict.items():
+                        if hasattr(self.config, key):
+                            old_value = getattr(self.config, key)
+                            if old_value != value:
+                                conflicting_fields.append(f"    {key}: {old_value} -> {value}")
+                            else:
+                                restored_fields.append(f"    {key}: {value}")
+                            setattr(self.config, key, value)
+                    
+                    # Log restored configurations
+                    if restored_fields:
+                        _log_info("  Restored (unchanged from current):")
+                        for field in restored_fields[:10]:  # Limit output
+                            _log_info(field)
+                        if len(restored_fields) > 10:
+                            _log_info(f"    ... and {len(restored_fields) - 10} more")
+                    
+                    if conflicting_fields:
+                        _log_warning("  Overridden by checkpoint (conflicts with current config):")
+                        for field in conflicting_fields:
+                            _log_warning(field)
+                    
+                    # Special handling for num_epochs (allow extension but not reduction)
+                    if 'num_epochs' in saved_config_dict:
+                        current_epochs = len(checkpoint.get('history', {}).get('train_loss', []))
+                        saved_epochs = saved_config_dict.get('num_epochs', 0)
+                        if self.config.num_epochs < saved_epochs:
+                            _log_warning(f"Current num_epochs ({self.config.num_epochs}) is less than checkpoint's ({saved_epochs})")
+                            _log_warning(f"Keeping checkpoint value: {saved_epochs}")
+                            setattr(self.config, 'num_epochs', saved_epochs)
+                        elif self.config.num_epochs > saved_epochs:
+                            _log_info(f"Extending training: {saved_epochs} -> {self.config.num_epochs} epochs")
+                            # Keep the extended value
+                        else:
+                            _log_info(f"Training duration unchanged: {self.config.num_epochs} epochs")
+                else:
+                    _log_warning("No configuration found in checkpoint, using current config")
+            else:
+                raise RuntimeError("Resume mode requires checkpoint, but none found")
+        
         # Save random states before creating data loaders
         self.random_states = {
             'torch': torch.get_rng_state(),
@@ -129,7 +193,14 @@ class Trainer:
             'random': random.getstate(),
         }
         
-        # Model
+        # Model (using restored config values)
+        _log_info(f"Creating Vision Transformer model with config:")
+        _log_info(f"  image_size: {self.config.image_size}")
+        _log_info(f"  patch_size: {self.config.patch_size}")
+        _log_info(f"  dim: {self.config.dim}")
+        _log_info(f"  depth: {self.config.depth}")
+        _log_info(f"  heads: {self.config.heads}")
+        
         self.model = VisionTransformer(
             img_size=config.image_size,
             patch_size=config.patch_size,
@@ -142,44 +213,48 @@ class Trainer:
             emb_dropout=config.emb_dropout
         ).to(self.device)
         
-        # Data loaders
+        # Data loaders (using restored config values)
+        _log_info(f"Creating data loaders with batch_size={self.config.batch_size}")
         self.train_loader, self.test_loader = get_cifar10_dataloaders(
             batch_size=config.batch_size,
             num_workers=config.num_workers
         )
         
-        # Loss and optimizer
+        # Loss and optimizer (using restored config values)
         self.criterion = nn.CrossEntropyLoss()
+        _log_info(f"Creating optimizer with lr={self.config.learning_rate}, weight_decay={self.config.weight_decay}")
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay
         )
         
-        # Learning rate scheduler with optional warmup
+        # Learning rate scheduler with optional warmup (using restored config values)
         n_batches = len(self.train_loader)
-
+        
         # If warmup_epochs is positive and strictly less than total epochs, use SequentialLR
         if getattr(config, 'warmup_epochs', 0) and config.warmup_epochs < config.num_epochs:
             warmup_iters = n_batches * config.warmup_epochs
             cosine_iters = n_batches * (config.num_epochs - config.warmup_epochs)
-
+            
             # Ensure cosine_iters is at least 1 to avoid ZeroDivisionError in CosineAnnealingLR
             if cosine_iters <= 0:
                 cosine_iters = 1
-
+            
+            _log_info(f"Creating SequentialLR scheduler with warmup_epochs={config.warmup_epochs}")
+            
             warmup_scheduler = LinearLR(
                 self.optimizer,
                 start_factor=0.01,
                 end_factor=1.0,
                 total_iters=warmup_iters
             )
-
+            
             cosine_scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=cosine_iters
             )
-
+            
             self.scheduler = optim.lr_scheduler.SequentialLR(
                 self.optimizer,
                 schedulers=[warmup_scheduler, cosine_scheduler],
@@ -189,10 +264,11 @@ class Trainer:
             # No warmup (either warmup_epochs == 0 or >= num_epochs): use single cosine scheduler
             if getattr(config, 'warmup_epochs', 0) >= config.num_epochs and config.num_epochs > 0:
                 _log_info(f"Warning: warmup_epochs ({config.warmup_epochs}) >= num_epochs ({config.num_epochs}) — disabling warmup and using cosine schedule for all epochs.")
-
+            
             total_iters = n_batches * max(1, config.num_epochs)
             # Ensure T_max >= 1
             T_max = max(1, total_iters)
+            _log_info(f"Creating CosineAnnealingLR scheduler (no warmup)")
             self.scheduler = CosineAnnealingLR(self.optimizer, T_max=T_max)
         
         # Training history
@@ -203,22 +279,65 @@ class Trainer:
             'test_acc': []
         }
         
-        # Resume from checkpoint if specified
-        if config.mode == 'resume':
-            if config.checkpoint_path is None:
-                _log_info("Resume mode but no checkpoint path specified, trying to find latest...")
-                config.checkpoint_path = get_latest_checkpoint()
+        # Resume: load model, optimizer, scheduler states AFTER they are created
+        if config.mode == 'resume' and config.checkpoint_path:
+            _log_info(f"Loading model and training states from: {config.checkpoint_path}")
             
-            if config.checkpoint_path:
-                loaded_data = load_checkpoint(
-                    self.model, config.checkpoint_path,
-                    self.optimizer, self.scheduler, self.device
-                )
-                self.history = loaded_data.get('history', self.history)
-                _log_info(f"Resumed from epoch {len(self.history['train_loss'])}")
+            # Restore random states from checkpoint
+            if 'random_states' in checkpoint:
+                random_states = checkpoint['random_states']
+                torch.set_rng_state(random_states['torch'])
+                if random_states['cuda'] is not None:
+                    torch.cuda.set_rng_state_all(random_states['cuda'])
+                np.random.set_state(random_states['np'])
+                random.setstate(random_states['random'])
+                _log_info("Random states restored from checkpoint")
+            
+            # Load model, optimizer, scheduler states
+            loaded_data = load_checkpoint(
+                self.model, config.checkpoint_path,
+                self.optimizer, self.scheduler, self.device
+            )
+            
+            # Restore history
+            self.history = loaded_data.get('history', self.history)
+            
+            # Log resume information
+            completed_epochs = len(self.history['train_loss'])
+            _log_info(f"Successfully resumed from checkpoint")
+            _log_info(f"  Completed epochs: {completed_epochs}")
+            _log_info(f"  Remaining epochs: {max(0, self.config.num_epochs - completed_epochs)}")
+            _log_info(f"  Best test accuracy so far: {max(self.history['test_acc']) if self.history['test_acc'] else 0:.2f}%")
+            
+            # Verify configuration consistency
+            saved_config_dict = checkpoint.get('config', {})
+            critical_fields = ['image_size', 'patch_size', 'dim', 'depth', 'heads', 'mlp_dim', 'num_classes']
+            inconsistencies = []
+            
+            for field in critical_fields:
+                if field in saved_config_dict and hasattr(self.config, field):
+                    if getattr(self.config, field) != saved_config_dict[field]:
+                        inconsistencies.append(field)
+            
+            if inconsistencies:
+                _log_error(f"CRITICAL: Model architecture fields differ from checkpoint: {inconsistencies}")
+                _log_error("This will likely cause errors during training!")
+                raise RuntimeError(f"Model architecture mismatch: {inconsistencies}")
             else:
-                raise RuntimeError("Resume mode requires checkpoint, but none found")
-    
+                _log_info("Model architecture verification passed")
+        
+        # Log final configuration summary
+        _log_info("=" * 60)
+        _log_info("Final configuration for training:")
+        _log_info(f"  Mode: {config.mode}")
+        _log_info(f"  Device: {self.device}")
+        _log_info(f"  Epochs: {config.num_epochs}")
+        _log_info(f"  Batch size: {config.batch_size}")
+        _log_info(f"  Learning rate: {config.learning_rate}")
+        _log_info(f"  Warmup epochs: {config.warmup_epochs}")
+        _log_info(f"  Weight decay: {config.weight_decay}")
+        _log_info(f"  Convergence patience: {config.convergence_patience}")
+        _log_info("=" * 60)
     def check_convergence(self, epoch, test_acc):
         """Double convergence check: accuracy + parameter changes."""
         # Check 1: Accuracy improvement
@@ -541,18 +660,56 @@ if __name__ == "__main__":
     if args.debug is not None:
         config.debug = args.debug
     
+    # Initialize logging BEFORE creating trainer
+    # Console only shows WARNING and above (INFO/DEBUG go to file only)
+    force_new_log = (config.mode != 'resume')
+    
+    # Set console level: WARNING by default, can be overridden
+    console_level = logging.WARNING
+    if args.verbose or args.debug:
+        # If verbose/debug, still keep console at WARNING to avoid clutter
+        console_level = logging.WARNING
+    
+    init_logging(
+        verbose=config.verbose, 
+        debug=config.debug, 
+        log_to_file=True,
+        console_output=True,
+        console_level=console_level,
+        force_new_log=force_new_log
+    )
+    
+    # These will go to file only (console won't show them)
+    _log_info("=" * 60)
+    _log_info("Program started")
+    _log_info(f"Mode: {config.mode}")
+    _log_info(f"Command line arguments: {vars(args)}")
+    _log_info(f"Verbose: {config.verbose}, Debug: {config.debug}")
+    _log_info("=" * 60)
+    
     trainer = Trainer(config)
     
-    if config.mode == 'dry_run':
-        trainer.dry_run()
-    elif config.mode == 'test':
-        # Auto-select latest checkpoint if not specified
-        if config.checkpoint_path is None:
-            config.checkpoint_path = get_latest_checkpoint()
-        
-        if config.checkpoint_path is None:
-            raise RuntimeError("Test mode requires checkpoint, but none found")
-        
-        test_mode(config)
-    else:  # train or resume
-        trainer.train()
+    try:
+        if config.mode == 'dry_run':
+            trainer.dry_run()
+        elif config.mode == 'test':
+            if config.checkpoint_path is None:
+                config.checkpoint_path = get_latest_checkpoint()
+            
+            if config.checkpoint_path is None:
+                raise RuntimeError("Test mode requires checkpoint, but none found")
+            
+            test_mode(config)
+        else:  # train or resume
+            trainer.train()
+    except Exception as e:
+        _log_error(f"Training failed with error: {e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        _log_error(traceback_str)
+        raise
+    finally:
+        _log_info("Program finished")
+        # Final flush
+        for handler in get_logger().handlers:
+            handler.flush()
