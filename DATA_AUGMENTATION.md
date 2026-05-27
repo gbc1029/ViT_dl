@@ -139,20 +139,34 @@ python train.py --affine --affine-translate 0.1
 
 ---
 
-### 7. **MixUp**（待实现）
+ ### 7. **MixUp** ⭐⭐⭐
 
-**状态：** 已定义MixUp类，但需要集成到训练循环中。
+ **状态：** ✅ 已完成，已集成到训练循环
 
-**技术难点：**
-- MixUp需要在batch级别应用，而非transform pipeline
-- 需要修改`train_epoch`方法来处理混合后的标签
+ **启用方式：**
+ ```bash
+ python train.py --mixup --mixup-alpha 0.2 --mixup-prob 0.5
+ ```
 
-**未来计划：**
-```python
-# 在train_epoch中添加
-mixup = MixUp(alpha=0.2, num_classes=config.num_classes)
-images, labels = mixup(images, labels)
-```
+ **参数说明：**
+ - `--mixup`: 启用MixUp（默认关闭）
+ - `--mixup-alpha`: Beta分布参数，推荐值：0.2（温和混合）
+ - `--mixup-prob`: 应用MixUp的概率，推荐值：0.5（50%）
+
+ **实现原理：**
+ ```python
+ # 在训练循环中，每个batch随机应用
+ lam = np.random.beta(alpha, alpha)  # 混合系数
+ mixed_imgs = lam * batch_imgs + (1 - lam) * batch_imgs[shuffled]
+ mixed_labels = lam * labels_onehot + (1 - lam) * labels_onehot[shuffled]
+ ```
+
+ **注意：**
+ - 使用时训练accuracy看起来会降低（混合标签导致），但test accuracy会提升
+ - 需要配合KL divergence loss（因为labels是概率分布）
+ - 与AMP完全兼容
+
+ **效果：** 提升精度0.5-1.5%，显著增强泛化能力。推荐配合RandAugment使用。
 
 ---
 
@@ -370,5 +384,74 @@ python train.py --model-size tiny --epochs 30 \
 
 ---
 
-**最后更新：** 2026-05-27
-**维护者：** ViT开发团队
+---
+
+ ## 8. **Stochastic Depth (DropPath)** ⭐⭐
+
+ **状态：** ✅ 已完成，已在TransformerBlock中实现
+
+ **启用方式：**
+ ```bash
+ python train.py --drop-path 0.15
+ ```
+
+ **参数说明：**
+ - `--drop-path`: Drop rate，推荐值：0.1-0.2（ViT-Small/Base）
+
+ **实现原理：**
+ ```python
+ # 在每个TransformerBlock的两个残差连接后应用
+ x = x + self.drop_path(self.attention(x))
+ x = x + self.drop_path(self.mlp(x))
+ ```
+
+ **效果：** 防止特征共适应，提升泛化能力。与Dropout互补（Dropout正则化features，DropPath正则化branches）。
+
+---
+
+ ## 9. **Kornia GPU加速（可选）**
+
+ **状态：** ✅ 已完成，可选启用
+
+ **启用方式：**
+ ```bash
+ # 需先安装kornia
+ pip install kornia
+ python train.py --kornia --randaug --cutout
+ ```
+
+ **优势：**
+ - 🚀 训练速度提升10-30%
+ - 💾 减少CPU-GPU传输开销
+ - 🎯 更大的batch size支持
+
+ **当前支持：**
+ - RandomCrop + RandomHorizontalFlip（始终）
+ - RandAugment
+ - RandomErasing (Cutout)
+
+---
+
+ ## 🎯 综合配置推荐
+
+ ### 最佳性能配置（推荐）
+ ```bash
+ python train.py --model-size base --epochs 100 \
+   --amp --ema-decay 0.9999 --grad-clip 1.0 \
+   --drop-path 0.15 \
+   --mixup --mixup-alpha 0.2 --mixup-prob 0.5 \
+   --randaug --randaug-n 2 --randaug-m 12 \
+   --cutout --cutout-length 16
+ ```
+
+ **解释：**
+ - **AMP**：速度+显存
+ - **EMA**：平滑权重，提升精度
+ - **GradClip**：稳定训练
+ - **DropPath**：正则化，防过拟合
+ - **MixUp**：批级别混合
+ - **RandAugment+Cutout**：数据增强黄金组合
+
+---
+
+ **最后更新：** 2026-05-27

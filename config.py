@@ -38,10 +38,11 @@ class Config:
     
     dropout = 0.1
     emb_dropout = 0.1
+    drop_path_rate = 0.0  # Stochastic Depth drop rate (0.0 = disabled). Recommended: 0.1-0.2
     
     # Training parameters
     batch_size = 64
-    num_epochs = 30
+    num_epochs = 100
     learning_rate = 3e-4
     weight_decay = 0.03
     warmup_epochs = 5
@@ -80,9 +81,13 @@ class Config:
     randaug_n = 2           # Number of augmentation transformations
     randaug_m = 9           # Magnitude of augmentation (1-10)
 
-    # Advanced data augmentation options
+     # Advanced data augmentation options
     use_cutout = False         # Enable Cutout/RandomErasing
     cutout_length = 16         # Cutout patch size (pixels)
+     
+    # GPU-accelerated augmentations with Kornia (experimental)
+    use_kornia = True         # Enable GPU-based Kornia augmentations (requires: pip install kornia)
+    # Note: When use_kornia=True, augmentations are applied on GPU for better performance
     
     # Basic augmentation enhancements
     use_color_jitter = False   # Enable ColorJitter (brightness/contrast/saturation/hue)
@@ -98,9 +103,10 @@ class Config:
     use_random_affine = False     # Enable random affine transformation
     affine_translate = 0.1        # Max translation as fraction of image size
     
-    # MixUp augmentation (requires special handling in train loop)
-    # Note: MixUp cannot be applied in transform pipeline, needs batch-level processing
-    # This is marked as TODO for future enhancement
+    # MixUp augmentation (batch-level mixing, applied in training loop)
+    use_mixup = False        # Enable MixUp augmentation
+    mixup_alpha = 0.2        # Beta distribution alpha parameter (typical 0.2)
+    mixup_prob = 0.5         # Probability of applying MixUp to a batch (0.5 = 50% chance)
     
     # Checkpoint selection (default: auto-select latest if not specified)
     checkpoint_selection = 'latest'  # 'exact' or 'latest' (for resume/test mode)

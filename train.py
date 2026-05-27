@@ -1,7 +1,7 @@
 """Training script for Vision Transformer on CIFAR-10 with multiple modes"""
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 from tqdm import tqdm
@@ -9,19 +9,15 @@ import argparse
 import os
 from datetime import datetime
 from glob import glob
-from data_loader import get_dataloaders
+from data_loader import get_dataloaders, get_dataloaders_with_kornia,KorniaDatasetWrapper,MixUp, KorniaAugmentationPipeline
 import numpy as np
 import random
 from model import VisionTransformer
-from data_loader import get_cifar10_dataloaders
 from config import Config
 from utils import plot_results, count_parameters, visualize_patches
 from utils import _log_info, _log_debug, _log_warning, _log_error, init_logging, get_logger
 import logging
-
-def get_model_type_prefix():
-    """Get model type prefix based on config."""
-    return 'vit'
+import sys
 
 
 def get_size_code(model_size):
@@ -84,7 +80,7 @@ def save_checkpoint(model, optimizer, scheduler, history, config, filename_prefi
             'np': np.random.get_state(),
             'random': random.getstate(),
         },
-        'saved_fields': [k for k in config.__dict__.keys() if k in ['warmup_epochs', 'device', 'batch_size', 'learning_rate', 'weight_decay', 'num_epochs', 'num_workers', 'dataset', 'model_size', 'label_smoothing', 'use_amp', 'ema_decay', 'grad_clip', 'randaug_enabled', 'randaug_n', 'randaug_m', 'use_cutout']],
+         'saved_fields': [k for k in config.__dict__.keys() if k in ['warmup_epochs', 'device', 'batch_size', 'learning_rate', 'weight_decay', 'num_epochs', 'num_workers', 'dataset', 'model_size', 'label_smoothing', 'use_amp', 'ema_decay', 'grad_clip', 'randaug_enabled', 'randaug_n', 'randaug_m', 'use_cutout', 'use_mixup', 'mixup_alpha', 'mixup_prob', 'drop_path_rate', 'use_kornia']],
     }
     
     # Add scheduler if exists
@@ -311,31 +307,50 @@ class Trainer:
             heads=config.heads,
             mlp_dim=config.mlp_dim,
             dropout=config.dropout,
-            emb_dropout=config.emb_dropout
+            emb_dropout=config.emb_dropout,
+            drop_path_rate=getattr(config, 'drop_path_rate', 0.0)
         ).to(self.device)
         
         # Data loaders (using restored config values)
         _log_info(f"Creating data loaders for {config.dataset} with batch_size={self.config.batch_size}")
-        self.train_loader, self.test_loader = get_dataloaders(
-            dataset=config.dataset,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-            data_dir=config.data_dir,
-            randaug_enabled=config.randaug_enabled,
-            randaug_n=config.randaug_n,
-            randaug_m=config.randaug_m,
-            use_cutout=config.use_cutout,
-            cutout_length=config.cutout_length,
-            use_color_jitter=config.use_color_jitter,
-            color_jitter_brightness=config.color_jitter_brightness,
-            color_jitter_contrast=config.color_jitter_contrast,
-            color_jitter_saturation=config.color_jitter_saturation,
-            color_jitter_hue=config.color_jitter_hue,
-            use_random_rotation=config.use_random_rotation,
-            rotation_degrees=config.rotation_degrees,
-            use_random_affine=config.use_random_affine,
-            affine_translate=config.affine_translate
-        )
+        
+        # Choose between Kornia (GPU) and torchvision (CPU) augmentations
+        if getattr(config, 'use_kornia', False):
+            _log_info("Using GPU-accelerated Kornia augmentations")
+            self.train_loader, self.test_loader = get_dataloaders_with_kornia(
+                dataset=config.dataset,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+                data_dir=config.data_dir,
+                randaug_enabled=config.randaug_enabled,
+                randaug_n=config.randaug_n,
+                randaug_m=config.randaug_m,
+                use_cutout=config.use_cutout,
+                device=self.device,
+                # color_jitter and geometric augs not supported in simplified Kornia version
+            )
+        else:
+            _log_info("Using standard torchvision (CPU) augmentations")
+            self.train_loader, self.test_loader = get_dataloaders(
+                dataset=config.dataset,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+                data_dir=config.data_dir,
+                randaug_enabled=config.randaug_enabled,
+                randaug_n=config.randaug_n,
+                randaug_m=config.randaug_m,
+                use_cutout=config.use_cutout,
+                cutout_length=config.cutout_length,
+                use_color_jitter=config.use_color_jitter,
+                color_jitter_brightness=config.color_jitter_brightness,
+                color_jitter_contrast=config.color_jitter_contrast,
+                color_jitter_saturation=config.color_jitter_saturation,
+                color_jitter_hue=config.color_jitter_hue,
+                use_random_rotation=config.use_random_rotation,
+                rotation_degrees=config.rotation_degrees,
+                use_random_affine=config.use_random_affine,
+                affine_translate=config.affine_translate
+            )
         
         # Loss and optimizer (using restored config values)
         self.label_smoothing = config.label_smoothing
@@ -343,12 +358,23 @@ class Trainer:
         # Create criterion with optional label smoothing
         kwargs = {}
         if self.label_smoothing > 0:
-            if hasattr(nn.CrossEntropyLoss, 'label_smoothing'):
-                kwargs['label_smoothing'] = self.label_smoothing
-                _log_info(f"Label smoothing enabled: {self.label_smoothing}")
-            else:
-                _log_warning(f"Label smoothing not supported by this PyTorch version, disabling")
-                _log_warning(f"PyTorch {torch.__version__} detected, requires >= 1.10 for label smoothing")
+            # Check if CrossEntropyLoss supports label_smoothing properly
+            # The API was added in PyTorch 1.10
+            try:
+                # First check if the parameter exists in the function signature
+                import inspect
+                sig = inspect.signature(nn.CrossEntropyLoss.__init__)
+                if 'label_smoothing' in sig.parameters:
+                    # Try creating a test instance to ensure parameter works
+                    test_criterion = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+                    kwargs['label_smoothing'] = self.label_smoothing
+                    _log_info(f"Label smoothing enabled: {self.label_smoothing}")
+                else:
+                    _log_warning(f"Label smoothing not supported by this PyTorch version (requires >= 1.10), disabling")
+                    self.label_smoothing = 0.0
+            except Exception as e:
+                _log_warning(f"Label smoothing initialization failed: {e}")
+                _log_warning(f"Label smoothing disabled")
                 self.label_smoothing = 0.0
         else:
             _log_info("Label smoothing disabled")
@@ -405,11 +431,28 @@ class Trainer:
         
         # AMP (Automatic Mixed Precision)
         self.use_amp = config.use_amp
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False)
+        
+        # Handle new PyTorch 2.x API for GradScaler
+        if hasattr(torch.amp, 'GradScaler'):
+            # PyTorch 2.x new API: torch.amp.GradScaler(device_type, args...)
+            self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False)
+
         if self.use_amp:
             _log_info(f"AMP enabled: {self.use_amp}")
         else:
             _log_info("AMP disabled")
+        
+        # MixUp augmentation (batch-level)
+        if getattr(config, 'use_mixup', False):
+            alpha = getattr(config, 'mixup_alpha', 0.2)
+            prob = getattr(config, 'mixup_prob', 0.5)
+            self.mixup = MixUp(alpha=alpha, num_classes=config.num_classes)
+            self.mixup_prob = prob
+            _log_info(f"MixUp enabled: alpha={alpha}, prob={prob}")
+        else:
+            self.mixup = None
+            self.mixup_prob = 0.0
+            _log_info("MixUp disabled")
         
         # Training history
         self.history = {
@@ -530,6 +573,12 @@ class Trainer:
         else:
             _log_info(f"  RandomAffine: disabled")
         
+        # MixUp (batch-level augmentation)
+        if getattr(config, 'use_mixup', False):
+            _log_info(f"  MixUp: enabled (alpha={getattr(config, 'mixup_alpha', 0.2)}, prob={getattr(config, 'mixup_prob', 0.5)})")
+        else:
+            _log_info(f"  MixUp: disabled")
+        
         _log_info("-" * 60)
         
     def check_convergence(self, epoch, test_acc):
@@ -568,7 +617,7 @@ class Trainer:
         print(f"Batch loaded successfully! Images shape: {images.shape}, Labels shape: {labels.shape}")
         
         # Forward pass with AMP
-        with torch.cuda.amp.autocast(enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False):
+        with torch.amp.autocast("cuda",enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False):
             outputs = self.model(images)
             loss = self.criterion(outputs, labels)
         print(f"Forward pass successful! Loss: {loss.item():.4f}")
@@ -589,7 +638,7 @@ class Trainer:
             print(f"eval pass successful! Accuracy on batch: {100 * accuracy:.2f}%")
     
     def train_epoch(self, epoch):
-        """Train for one epoch."""
+        """Train for one epoch with optional MixUp."""
         self.model.train()
         train_loss = 0.0
         correct = 0
@@ -598,12 +647,31 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config.num_epochs}')
         
         for images, labels in pbar:
-            images, labels = images.to(self.device), labels.to(self.device)
+            images, labels = images.to(self.device,non_blocking=True), labels.to(self.device,non_blocking=True)
+            mixup_applied = False
+            
+            # Apply MixUp if enabled and random check passes
+            if self.mixup is not None and random.random() < self.mixup_prob:
+                images, labels = self.mixup(images, labels)
+                mixup_applied = True
+                # Note: labels are now one-hot distributions
             
             # Forward pass with AMP autocast
-            with torch.cuda.amp.autocast(enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False):
+            with torch.amp.autocast("cuda",enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False):
                 outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
+                
+                # Special handling for MixUp loss
+                if mixup_applied:
+                    # MixUp requires KL divergence loss with one-hot labels
+                    loss = F.kl_div(
+                        F.log_softmax(outputs, dim=1),
+                        labels,  # Already one-hot from MixUp
+                        reduction='batchmean',
+                        log_target=False
+                    )
+                else:
+                    # Standard CrossEntropy loss
+                    loss = self.criterion(outputs, labels)
             
             # Backward pass with AMP scaler
             self.optimizer.zero_grad()
@@ -621,11 +689,19 @@ class Trainer:
             
             self.scheduler.step()
             
-            # Statistics
+            # Statistics - special handling for MixUp
             train_loss += loss.item()
+            
+            # Calculate accuracy for display
+            if mixup_applied:
+                # For MixUp, convert one-hot back to class indices for display accuracy
+                _, pred_labels = labels.max(1)
+            else:
+                pred_labels = labels
+            
             _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            total += pred_labels.size(0)
+            correct += predicted.eq(pred_labels).sum().item()
             
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
@@ -643,7 +719,10 @@ class Trainer:
         return avg_loss, avg_acc
     
     def evaluate(self):
-        """Evaluate on test set."""
+        """Evaluate on test set.
+        
+        Note: MixUp is NOT used during evaluation (only for training).
+        """
         self.model.eval()
         test_loss = 0.0
         correct = 0
@@ -653,8 +732,14 @@ class Trainer:
             for images, labels in tqdm(self.test_loader, desc='Testing'):
                 images, labels = images.to(self.device), labels.to(self.device)
                 
-                outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
+                # Apply AMP autocast (optional)
+                if self.use_amp:
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        outputs = self.model(images)
+                        loss = self.criterion(outputs, labels)
+                else:
+                    outputs = self.model(images)
+                    loss = self.criterion(outputs, labels)
                 
                 test_loss += loss.item()
                 _, predicted = outputs.max(1)
@@ -776,7 +861,8 @@ def test_mode(config):
         heads=config.heads,
         mlp_dim=config.mlp_dim,
         dropout=config.dropout,
-        emb_dropout=config.emb_dropout
+        emb_dropout=config.emb_dropout,
+        drop_path_rate=getattr(config, 'drop_path_rate', 0.0)
     ).to(device)
     
     # Load checkpoint
@@ -799,8 +885,15 @@ def test_mode(config):
     
     # Create criterion with same label smoothing as training
     kwargs = {}
-    if config.label_smoothing > 0 and hasattr(nn.CrossEntropyLoss, 'label_smoothing'):
-        kwargs['label_smoothing'] = config.label_smoothing
+    if config.label_smoothing > 0:
+        try:
+            import inspect
+            sig = inspect.signature(nn.CrossEntropyLoss.__init__)
+            if 'label_smoothing' in sig.parameters:
+                test_criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
+                kwargs['label_smoothing'] = config.label_smoothing
+        except Exception:
+            pass
     
     criterion = nn.CrossEntropyLoss(**kwargs)
     
@@ -847,7 +940,7 @@ def parse_args():
                        help='Label smoothing epsilon (0.0 to 0.5, typical 0.1)')
     
     # AMP
-    parser.add_argument('--amp', action='store_true', default=None,
+    parser.add_argument('--amp', action='store_true', default=False,
                        help='Enable Automatic Mixed Precision (AMP) training')
 
     # EMA
@@ -859,7 +952,7 @@ def parse_args():
                        help='Max gradient norm (0.0=disabled, recommend 1.0)')
 
     # RandAugment
-    parser.add_argument('--randaug', action='store_true', default=None,
+    parser.add_argument('--randaug', action='store_true', default=False,
                        help='Enable RandAugment data augmentation')
     parser.add_argument('--randaug-n', type=int, default=None,
                        help='RandAugment: number of transformations')
@@ -867,13 +960,13 @@ def parse_args():
                        help='RandAugment: magnitude (1-10)')
 
     # Cutout
-    parser.add_argument('--cutout', action='store_true', default=None,
+    parser.add_argument('--cutout', action='store_true', default=False,
                        help='Enable Cutout/RandomErasing augmentation')
     parser.add_argument('--cutout-length', type=int, default=None,
                        help='Cutout patch length in pixels')
     
     # Color Jitter
-    parser.add_argument('--color-jitter', action='store_true', default=None,
+    parser.add_argument('--color-jitter', action='store_true', default=False,
                        help='Enable ColorJitter augmentation (brightness/contrast/saturation/hue)')
     parser.add_argument('--color-jitter-brightness', type=float, default=None,
                        help='ColorJitter brightness jitter range (default 0.2)')
@@ -885,128 +978,86 @@ def parse_args():
                        help='ColorJitter hue jitter range (default 0.1)')
     
     # Geometric augmentation
-    parser.add_argument('--rotation', action='store_true', default=None,
+    parser.add_argument('--rotation', action='store_true', default=False,
                        help='Enable random rotation augmentation')
     parser.add_argument('--rotation-degrees', type=float, default=None,
                        help='Max rotation degrees (default 15)')
-    parser.add_argument('--affine', action='store_true', default=None,
+    parser.add_argument('--affine', action='store_true', default=False,
                        help='Enable random affine transformation')
     parser.add_argument('--affine-translate', type=float, default=None,
                        help='Max translation as fraction of image (default 0.1)')
     
-    parser.add_argument('--verbose', action='store_true', default=None,
+    # MixUp augmentation
+    parser.add_argument('--mixup', action='store_true', default=False,
+                       help='Enable MixUp augmentation')
+    parser.add_argument('--mixup-alpha', type=float, default=None,
+                       help='MixUp beta distribution alpha (default 0.2)')
+    parser.add_argument('--mixup-prob', type=float, default=None,
+                       help='Probability of applying MixUp to a batch (default 0.5)')
+    
+    # Stochastic Depth (DropPath)
+    parser.add_argument('--drop-path', type=float, default=None,
+                        help='Stochastic Depth drop rate (0.0=disabled, recommend 0.1-0.2)')
+     
+     # Kornia GPU Augmentations
+    parser.add_argument('--kornia', action='store_true', default=False,
+                        help='Enable GPU-accelerated augmentations with Kornia (requires: pip install kornia)')
+    
+    parser.add_argument('--verbose', action='store_true', default=False,
                        help='Enable verbose logging')
-    parser.add_argument('--debug', action='store_true', default=None,
+    parser.add_argument('--debug', action='store_true', default=False,
                        help='Enable debug logging')
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     
-    print(f"PyTorch版本: {torch.__version__}")
-    print(f"CUDA是否可用: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA版本: {torch.version.cuda}")
-        print(f"GPU数量: {torch.cuda.device_count()}")
-        print(f"当前GPU: {torch.cuda.get_device_name(0)}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"CUDA: {torch.cuda.is_available()}")
+    sys.stdout.flush()
         
     args = parse_args()
     config = Config()
     
-    # Sync command line arguments to Config
-    # Priority: command line > config.py defaults
-    if args.mode is not None:
-        config.mode = args.mode
-    if args.checkpoint is not None:
-        config.checkpoint_path = args.checkpoint
-    if args.epochs is not None:
-        config.num_epochs = args.epochs
-    if args.batch_size is not None:
-        config.batch_size = args.batch_size
-    if args.lr is not None:
-        config.learning_rate = args.lr
-    if args.warmup_epochs is not None:
-        config.warmup_epochs = args.warmup_epochs
-    if args.weight_decay is not None:
-        config.weight_decay = args.weight_decay
-    if args.model_size is not None:
-        config.model_size = args.model_size
-    if args.dataset is not None:
-        config.dataset = args.dataset
-    if args.label_smoothing is not None:
-        config.label_smoothing = args.label_smoothing
-    if args.amp is not None:
-        config.use_amp = args.amp
-    if args.ema_decay is not None:
-        config.ema_decay = args.ema_decay
-    if args.grad_clip is not None:
-        config.grad_clip = args.grad_clip
-    if args.randaug is not None:
-        config.randaug_enabled = args.randaug
-    if args.randaug_n is not None:
-        config.randaug_n = args.randaug_n
-    if args.randaug_m is not None:
-        config.randaug_m = args.randaug_m
-    if args.cutout is not None:
-        config.use_cutout = args.cutout
-    if args.cutout_length is not None:
-        config.cutout_length = args.cutout_length
-    if args.color_jitter is not None:
-        config.use_color_jitter = args.color_jitter
-    if args.color_jitter_brightness is not None:
-        config.color_jitter_brightness = args.color_jitter_brightness
-    if args.color_jitter_contrast is not None:
-        config.color_jitter_contrast = args.color_jitter_contrast
-    if args.color_jitter_saturation is not None:
-        config.color_jitter_saturation = args.color_jitter_saturation
-    if args.color_jitter_hue is not None:
-        config.color_jitter_hue = args.color_jitter_hue
-    if args.rotation is not None:
-        config.use_random_rotation = args.rotation
-    if args.rotation_degrees is not None:
-        config.rotation_degrees = args.rotation_degrees
-    if args.affine is not None:
-        config.use_random_affine = args.affine
-    if args.affine_translate is not None:
-        config.affine_translate = args.affine_translate
-    if args.verbose is not None:
-        config.verbose = args.verbose
-    if args.debug is not None:
-        config.debug = args.debug
+    # Quick args sync
+    config.mode = args.mode or config.mode
+    config.model_size = args.model_size or config.model_size
+    config.num_epochs = args.epochs or config.num_epochs
+    config.batch_size = args.batch_size or config.batch_size
     
     # Initialize logging BEFORE creating trainer
-    # Console only shows WARNING and above (INFO/DEBUG go to file only)
     force_new_log = (config.mode != 'resume')
     
-    # Set console level: WARNING by default, can be overridden
-    console_level = logging.WARNING
-    if args.verbose or args.debug:
-        # If verbose/debug, still keep console at WARNING to avoid clutter
-        console_level = logging.WARNING
+    # For dry_run, show INFO to console for visibility
+    console_level = logging.INFO if config.mode == 'dry_run' else logging.WARNING
     
-    init_logging(
-        verbose=config.verbose, 
-        debug=config.debug, 
-        log_to_file=True,
-        console_output=True,
-        console_level=console_level,
-        force_new_log=force_new_log
-    )
+    try:
+        init_logging(
+            verbose=config.verbose, 
+            debug=config.debug, 
+            log_to_file=config.mode != 'dry_run',
+            console_output=True,
+            console_level=console_level,
+            force_new_log=force_new_log
+        )
+        print(f"init_logging OK")
+    except Exception as e:
+        print(f"init_logging failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     
-    # These will go to file only (console won't show them)
-    _log_info("=" * 60)
-    _log_info("Program started")
-    _log_info(f"Mode: {config.mode}")
-    _log_info(f"Command line arguments: {vars(args)}")
-    _log_info(f"Verbose: {config.verbose}, Debug: {config.debug}")
-    _log_info("=" * 60)
+    print(f"Creating Trainer...")
+    sys.stdout.flush()
     
     trainer = Trainer(config)
     
     try:
         if config.mode == 'dry_run':
+            print(f"Starting dry_run...")
             trainer.dry_run()
         elif config.mode == 'test':
+            print(f"Starting test...")
             if config.checkpoint_path is None:
                 config.checkpoint_path = get_latest_checkpoint(config)
             
@@ -1015,6 +1066,7 @@ if __name__ == "__main__":
             
             test_mode(config)
         else:  # train or resume
+            print(f"Starting train...")
             trainer.train()
     except Exception as e:
         _log_error(f"Training failed with error: {e}")

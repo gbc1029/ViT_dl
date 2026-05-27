@@ -4,6 +4,37 @@ import torch
 import torch.nn as nn
 
 
+class StochasticDepth(nn.Module):
+    """Stochastic Depth (DropPath) regularization.
+    
+    Randomly drops entire residual branches during training.
+    Improves generalization by preventing co-adaptation of features.
+    
+    Args:
+        drop_prob: Probability of dropping the branch (0.0 = no drop, 1.0 = always drop)
+        scale_by_keep: Whether to scale outputs by 1/(1-drop_prob) to maintain expected sum
+    """
+    def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
+        super().__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+    
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # (B, 1, 1, ...)
+        
+        # Generate random tensor for dropping
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        
+        if keep_prob > 0.0 and self.scale_by_keep:
+            random_tensor.div_(keep_prob)
+        
+        return x * random_tensor
+
+
 class PatchEmbedding(nn.Module):
     """Split image into patches and embed them."""
     
@@ -103,18 +134,21 @@ class MLP(nn.Module):
 class TransformerBlock(nn.Module):
     """Transformer encoder block with pre-norm."""
     
-    def __init__(self, dim, heads, mlp_dim, dropout=0.1):
+    def __init__(self, dim, heads, mlp_dim, dropout=0.1, drop_path_rate=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = MultiHeadAttention(dim, heads, dropout)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, mlp_dim, dropout)
         
+        # Add DropPath after each residual connection
+        self.drop_path = StochasticDepth(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        
     def forward(self, x):
-        # Pre-norm attention with residual
-        x = x + self.attn(self.norm1(x))
-        # Pre-norm MLP with residual
-        x = x + self.mlp(self.norm2(x))
+        # Pre-norm attention with residual and DropPath
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        # Pre-norm MLP with residual and DropPath
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -132,7 +166,8 @@ class VisionTransformer(nn.Module):
         heads=8,
         mlp_dim=512,
         dropout=0.1,
-        emb_dropout=0.1
+        emb_dropout=0.1,
+        drop_path_rate=0.0  # New parameter
     ):
         super().__init__()
         
@@ -142,10 +177,20 @@ class VisionTransformer(nn.Module):
         
         self.dropout = nn.Dropout(emb_dropout)
         
-        # Transformer encoder
+        # Create drop path rates (can be uniform or linear schedule)
+        if isinstance(drop_path_rate, (int, float)):
+            # Uniform drop path rate for all blocks
+            dpr = [drop_path_rate] * depth
+        elif isinstance(drop_path_rate, list):
+            # Custom drop path rates for each block
+            dpr = drop_path_rate
+        else:
+            dpr = [0.0] * depth
+        
+        # Transformer encoder with drop path
         self.transformer = nn.Sequential(*[
-            TransformerBlock(dim, heads, mlp_dim, dropout)
-            for _ in range(depth)
+            TransformerBlock(dim, heads, mlp_dim, dropout, drop_path_rate=dpr[i])
+            for i in range(depth)
         ])
         
         # Classification head
@@ -204,7 +249,8 @@ if __name__ == "__main__":
             heads=cfg.heads,
             mlp_dim=cfg.mlp_dim,
             dropout=cfg.dropout,
-            emb_dropout=cfg.emb_dropout
+            emb_dropout=cfg.emb_dropout,
+            drop_path_rate=getattr(cfg, 'drop_path_rate', 0.0)
         )
         
         x = torch.randn(2, 3, 32, 32)

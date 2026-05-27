@@ -1,4 +1,4 @@
-"""Data loading utilities for CIFAR-10/CIFAR-100 with advanced augmentation"""
+"""Data loading utilities for CIFAR-10/CIFAR-100 with advanced augmentation (Kornia GPU version)"""
 
 import torch
 from torch.utils.data import DataLoader
@@ -7,6 +7,15 @@ import torchvision.transforms.functional as F
 from torchvision.datasets import CIFAR10, CIFAR100
 import numpy as np
 import random
+
+# Optional Kornia import for GPU augmentations
+try:
+    import kornia.augmentation as K
+    # RandAugment is in kornia.augmentation, not augmentation.auto
+    KORNIA_AVAILABLE = True
+except ImportError:
+    KORNIA_AVAILABLE = False
+    print("Warning: Kornia not available. Falling back to torchvision transforms.")
 
 
 class Cutout(object):
@@ -86,6 +95,103 @@ class MixUp(object):
         
         return mixed_imgs, mixed_labels
 
+class KorniaAugmentationPipeline:
+    """GPU-accelerated augmentation pipeline using Kornia.
+    
+    This pipeline applies augmentations at the batch level on GPU,
+    avoiding CPU-GPU transfer overhead during training.
+    
+    NOTE: This is a simplified version that only supports basic operations
+    if the standalone kornia_augmentations module is not used.
+    """
+    
+    def __init__(self, 
+                 use_flip_crop=True,
+                 randaug_enabled=False,
+                 randaug_n=2,
+                 randaug_m=9,
+                 use_cutout=False,
+                 device='cuda'):
+        
+        self.device = device
+        self.use_flip_crop = use_flip_crop
+        self.randaug_enabled = randaug_enabled
+        self.use_cutout = use_cutout
+        
+        if not KORNIA_AVAILABLE:
+            raise ImportError("Kornia is required for GPU augmentations. Install with: pip install kornia")
+        
+        # Always add random horizontal flip (batch-level)
+        self.flip_aug = K.RandomHorizontalFlip(same_on_batch=False, p=0.5)
+        
+        # RandAugment (replaces ColorJitter)
+        if randaug_enabled:
+            self.randaug = K.RandAugment(
+                num_ops=randaug_n,
+                magnitude=randaug_m,
+                same_on_batch=False
+            )
+        else:
+            self.randaug = None
+        
+        # RandomErasing (Cutout)
+        if use_cutout:
+            self.erasing = K.RandomErasing(
+                p=0.5,
+                scale=(0.02, 0.15),
+                ratio=(0.3, 3.3),
+                same_on_batch=False
+            )
+        else:
+            self.erasing = None
+        
+        # Move to device
+        self.flip_aug = self.flip_aug.to(device)
+        if self.randaug:
+            self.randaug = self.randaug.to(device)
+        if self.erasing:
+            self.erasing = self.erasing.to(device)
+    
+    def random_crop_with_padding(self, batch_imgs, padding=4):
+        """Apply random crop with padding (simulates torchvision's RandomCrop)."""
+        b, c, h, w = batch_imgs.shape
+        
+        # Pad the images
+        batch_imgs = torch.nn.functional.pad(
+            batch_imgs, 
+            (padding, padding, padding, padding), 
+            mode='reflect'
+        )
+        
+        # Random crop back to original size
+        crop_size = h  # CIFAR-10 is 32x32
+        top = torch.randint(0, 2 * padding + 1, (1,), device=self.device).item()
+        left = torch.randint(0, 2 * padding + 1, (1,), device=self.device).item()
+        
+        return batch_imgs[:, :, top:top+crop_size, left:left+crop_size]
+    
+    def __call__(self, batch_imgs, batch_labels=None):
+        """Apply augmentations to a batch of images."""
+        batch_imgs = batch_imgs.to(self.device)
+        
+        # Random crop with padding (simulates RandomCrop(32, padding=4))
+        if self.use_flip_crop:
+            batch_imgs = self.random_crop_with_padding(batch_imgs, padding=4)
+        
+        # Random horizontal flip
+        batch_imgs = self.flip_aug(batch_imgs)
+        
+        # RandAugment
+        if self.randaug:
+            batch_imgs = self.randaug(batch_imgs)
+        
+        # RandomErasing (Cutout)
+        if self.erasing:
+            batch_imgs = self.erasing(batch_imgs)
+        
+        if batch_labels is not None:
+            return batch_imgs, batch_labels
+        return batch_imgs
 
 def get_train_transform(dataset='cifar10', randaug_enabled=False, randaug_n=2, randaug_m=9,
                         use_cutout=False, cutout_length=16, use_color_jitter=False,
@@ -145,15 +251,11 @@ def get_train_transform(dataset='cifar10', randaug_enabled=False, randaug_n=2, r
     if randaug_enabled:
         # Check if RandAugment is available (torchvision >= 0.9)
         rand_augment = getattr(transforms, 'RandAugment', None)
-        auto_augment = getattr(transforms, 'AutoAugment', None)
         
         if rand_augment is not None:
             transform_list.append(rand_augment(num_ops=randaug_n, magnitude=randaug_m))
-        elif auto_augment is not None:
-            # Fallback to AutoAugment if RandAugment not available
-            transform_list.append(auto_augment(transforms.AutoAugmentPolicy.CIFAR10))
         else:
-            print("Warning: RandAugment/AutoAugment not available, falling back to ColorJitter")
+            print("Warning: RandAugment not available, falling back to ColorJitter")
             use_color_jitter = True
     else:
         # 5. Color Jitter (optional, not used if RandAugment enabled)
@@ -174,7 +276,7 @@ def get_train_transform(dataset='cifar10', randaug_enabled=False, randaug_n=2, r
         # Try RandomErasing first (more recent)
         random_erasing = getattr(transforms, 'RandomErasing', None)
         if random_erasing is not None:
-            transform_list.append(RandomErasing(
+            transform_list.append(transforms.RandomErasing(
                 p=0.5,
                 scale=(0.02, 0.15),
                 ratio=(0.3, 3.3),
@@ -201,107 +303,9 @@ def get_test_transform(dataset='cifar10'):
         transforms.Normalize(mean, std)
     ])
 
-
-def get_cifar10_dataloaders(batch_size=64, num_workers=4, data_dir='./data',
-                             randaug_enabled=False, randaug_n=2, randaug_m=9,
-                             use_cutout=False, **kwargs):
-    """Get CIFAR-10 data loaders with advanced transforms."""
-    
-    train_transform = get_train_transform(
-        dataset='cifar10',
-        randaug_enabled=randaug_enabled,
-        randaug_n=randaug_n,
-        randaug_m=randaug_m,
-        use_cutout=use_cutout,
-        **kwargs
-    )
-    
-    test_transform = get_test_transform(dataset='cifar10')
-    
-    train_dataset = CIFAR10(
-        root=data_dir, 
-        train=True, 
-        download=False, 
-        transform=train_transform
-    )
-    
-    test_dataset = CIFAR10(
-        root=data_dir, 
-        train=False, 
-        download=False, 
-        transform=test_transform
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    return train_loader, test_loader
-
-
-def get_cifar100_dataloaders(batch_size=64, num_workers=4, data_dir='./data',
-                              randaug_enabled=False, randaug_n=2, randaug_m=9,
-                              use_cutout=False, **kwargs):
-    """Get CIFAR-100 data loaders with advanced transforms."""
-    
-    train_transform = get_train_transform(
-        dataset='cifar100',
-        randaug_enabled=randaug_enabled,
-        randaug_n=randaug_n,
-        randaug_m=randaug_m,
-        use_cutout=use_cutout,
-        **kwargs
-    )
-    
-    test_transform = get_test_transform(dataset='cifar100')
-    
-    train_dataset = CIFAR100(
-        root=data_dir, 
-        train=True, 
-        download=False, 
-        transform=train_transform
-    )
-    
-    test_dataset = CIFAR100(
-        root=data_dir, 
-        train=False, 
-        download=False, 
-        transform=test_transform
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    return train_loader, test_loader
-
-
 def get_dataloaders(dataset='cifar10', batch_size=64, num_workers=4, data_dir='./data',
-                    **kwargs):
+                    randaug_enabled=False, randaug_n=2, randaug_m=9,
+                    use_cutout=False,**kwargs):
     """
     Get data loaders for the specified dataset with all augmentation options.
     
@@ -315,23 +319,162 @@ def get_dataloaders(dataset='cifar10', batch_size=64, num_workers=4, data_dir='.
     Returns:
         train_loader, test_loader: Training and testing data loaders
     """
-    if dataset == 'cifar10':
-        return get_cifar10_dataloaders(
-            batch_size=batch_size, 
-            num_workers=num_workers, 
-            data_dir=data_dir,
+    if dataset == 'cifar10' or dataset == 'cifar100':
+        train_transform = get_train_transform(
+            dataset=dataset,
+            randaug_enabled=randaug_enabled,
+            randaug_n=randaug_n,
+            randaug_m=randaug_m,
+            use_cutout=use_cutout,
             **kwargs
         )
-    elif dataset == 'cifar100':
-        return get_cifar100_dataloaders(
-            batch_size=batch_size, 
-            num_workers=num_workers, 
-            data_dir=data_dir,
-            **kwargs
+        test_transform = get_test_transform(dataset='cifar100')
+        if dataset == 'cifar10':
+            train_dataset = CIFAR10(root=data_dir, train=True, download=False, transform=train_transform)
+            test_dataset = CIFAR10(root=data_dir, train=False, download=False, transform=test_transform)
+        else:  # cifar100
+            train_dataset = CIFAR100(root=data_dir, train=True, download=False, transform=train_transform)
+            test_dataset = CIFAR100(root=data_dir, train=False, download=False, transform=test_transform)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=True,
+            pin_memory=True
         )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            persistent_workers=True,
+            pin_memory=True
+        )
+        return train_loader, test_loader
     else:
         raise ValueError(f"Invalid dataset: {dataset}. Must be 'cifar10' or 'cifar100'")
 
+# Wrap the dataset with Kornia augmentations
+class KorniaDatasetWrapper(torch.utils.data.Dataset):
+    def __init__(self, dataset, kornia_pipeline):
+        self.dataset = dataset
+        self.kornia_pipeline = kornia_pipeline
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        img, label = self.dataset[idx]
+        return img, label
+    
+    def kornia_collate_fn(self, batch):
+        imgs, labels = zip(*batch)
+        imgs = torch.stack(imgs)  # (B, C, H, W)
+        labels = torch.tensor(labels)
+        
+        # Apply GPU augmentations
+        imgs, labels = self.kornia_pipeline(imgs, labels)
+        
+        return imgs, labels
+
+def get_dataloaders_with_kornia(
+    dataset='cifar10', 
+    batch_size=64, 
+    num_workers=0, 
+    data_dir='./data',
+    randaug_enabled=False,
+    randaug_n=2,
+    randaug_m=9,
+    use_cutout=False,
+    device=torch.device('cuda'),
+    **kwargs
+):
+    """
+    Get data loaders with GPU-based Kornia augmentations.
+    
+    Args:
+        dataset: 'cifar10' or 'cifar100'
+        batch_size: Batch size
+        num_workers: Number of data loading workers
+        data_dir: Dataset directory
+        randaug_enabled: Enable RandAugment
+        randaug_n: Number of RandAugment operations
+        randaug_m: RandAugment magnitude
+        use_cutout: Enable RandomErasing
+        device: Device for augmentations
+        **kwargs: Additional parameters (ignored, for compatibility)
+    
+    Returns:
+        train_loader_kornia, test_loader: Kornia-enhanced train loader, standard test loader
+    """
+    if not KORNIA_AVAILABLE:
+        raise ImportError(
+            "Kornia is required for GPU augmentations. "
+            "Install with: pip install kornia\n"
+            "Or run: conda install kornia -c conda-forge"
+        )
+    
+    # Get dataset-specific normalization
+    if dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2470, 0.2435, 0.2616]
+    else:  # cifar100
+        mean = [0.5071, 0.4867, 0.4408]
+        std = [0.2675, 0.2565, 0.2761]
+    
+    # CPU preprocessing only (ToTensor + Normalize)
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+    
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+    
+    # Load datasets
+    if dataset == 'cifar10':
+        train_dataset = CIFAR10(root=data_dir, train=True, download=False, transform=train_transform)
+        test_dataset = CIFAR10(root=data_dir, train=False, download=False, transform=test_transform)
+    elif dataset == 'cifar100':
+        train_dataset = CIFAR100(root=data_dir, train=True, download=False, transform=train_transform)
+        test_dataset = CIFAR100(root=data_dir, train=False, download=False, transform=test_transform)
+    else:
+        raise ValueError(f"Invalid dataset: {dataset}")
+    
+    # Create Kornia augmentation pipeline
+    kornia_pipeline = KorniaAugmentationPipeline(
+        use_flip_crop=True,
+        randaug_enabled=randaug_enabled,
+        randaug_n=randaug_n,
+        randaug_m=randaug_m,
+        use_cutout=use_cutout,
+        device=device
+    )
+    
+    kornia_wrapper = KorniaDatasetWrapper(train_dataset, kornia_pipeline)
+
+    # Create data loaders
+    train_loader = DataLoader(
+        kornia_wrapper,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,  # Must be 0 for GPU augmentations to avoid multiprocessing issues
+        pin_memory=False,
+        collate_fn=kornia_wrapper.kornia_collate_fn
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=False
+    )
+    
+    return train_loader, test_loader
 
 if __name__ == "__main__":
     print("Testing advanced data augmentation...")
