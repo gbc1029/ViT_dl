@@ -1,4 +1,4 @@
-"""Vision Transformer (ViT) implementation for CIFAR-10"""
+"""Vision Transformer (ViT) implementation for CIFAR-10/CIFAR-100"""
 
 import torch
 import torch.nn as nn
@@ -185,24 +185,29 @@ class VisionTransformer(nn.Module):
 
 
 if __name__ == "__main__":
-    # Test the model
+    # Test the model with different sizes
     from config import Config
-    cfg = Config()
     
-    model = VisionTransformer(
-        img_size=cfg.image_size,
-        patch_size=cfg.patch_size,
-        in_channels=3,
-        num_classes=cfg.num_classes,
-        dim=cfg.dim,
-        depth=cfg.depth,
-        heads=cfg.heads,
-        mlp_dim=cfg.mlp_dim,
-        dropout=cfg.dropout,
-        emb_dropout=cfg.emb_dropout
-    )
+    print("Testing ViT with different model sizes:\n")
     
-    x = torch.randn(2, 3, 32, 32)
-    out = model(x)
-    print(f"Output shape: {out.shape}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    for model_size in ['tiny', 'small', 'base']:
+        cfg = Config()
+        cfg.model_size = model_size
+        
+        model = VisionTransformer(
+            img_size=cfg.image_size,
+            patch_size=cfg.patch_size,
+            in_channels=3,
+            num_classes=cfg.num_classes,
+            dim=cfg.dim,
+            depth=cfg.depth,
+            heads=cfg.heads,
+            mlp_dim=cfg.mlp_dim,
+            dropout=cfg.dropout,
+            emb_dropout=cfg.emb_dropout
+        )
+        
+        x = torch.randn(2, 3, 32, 32)
+        out = model(x)
+        print(f"{model_size.upper():6s} - Output shape: {out.shape}, "
+              f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")

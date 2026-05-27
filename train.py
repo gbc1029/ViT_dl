@@ -9,6 +9,7 @@ import argparse
 import os
 from datetime import datetime
 from glob import glob
+from data_loader import get_dataloaders
 import numpy as np
 import random
 from model import VisionTransformer
@@ -18,42 +19,90 @@ from utils import plot_results, count_parameters, visualize_patches
 from utils import _log_info, _log_debug, _log_warning, _log_error, init_logging, get_logger
 import logging
 
-def save_checkpoint(model, optimizer, scheduler, history, config, filename='checkpoint'):
+def get_model_type_prefix():
+    """Get model type prefix based on config."""
+    return 'vit'
+
+
+def get_size_code(model_size):
+    """Get size code for checkpoint naming."""
+    if model_size == 'tiny':
+        return 't'
+    elif model_size == 'small':
+        return 's'
+    elif model_size == 'base':
+        return 'b'
+    else:
+        raise ValueError(f"Invalid model_size: {model_size}")
+
+
+def get_dataset_code(dataset):
+    """Get dataset code for checkpoint naming."""
+    if dataset == 'cifar10':
+        return '10'
+    elif dataset == 'cifar100':
+        return '100'
+    else:
+        raise ValueError(f"Invalid dataset: {dataset}")
+
+
+def get_checkpoint_dir(config):
+    """Get checkpoint directory based on model type."""
+    return 'checkpoints/vit'
+
+
+def save_checkpoint(model, optimizer, scheduler, history, config, filename_prefix='', scaler=None):
     """Save model checkpoint with timestamp."""
-    save_dir = 'checkpoints'
+    # Get save directory based on model type
+    save_dir = get_checkpoint_dir(config)
     os.makedirs(save_dir, exist_ok=True)
     
-    # Add timestamp to filename
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    save_path = os.path.join(save_dir, f"{filename}_{timestamp}.pth")
+    # Get size and dataset codes
+    size_code = get_size_code(config.model_size)
+    dataset_code = get_dataset_code(config.dataset)
     
-    # Prepare checkpoint dict
+    # Build filename: {size}_{dataset}_{timestamp}.pth
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if filename_prefix:
+        filename = f"{filename_prefix}_{size_code}_{dataset_code}_{timestamp}.pth"
+    else:
+        filename = f"{size_code}_{dataset_code}_{timestamp}.pth"
+    
+    save_path = os.path.join(save_dir, filename)
+    
+    # Prepare checkpoint dict with dataset and model size info
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'history': history,
         'config': config.__dict__,
+        'dataset': config.dataset,
+        'model_size': config.model_size,
         'random_states': {
             'torch': torch.get_rng_state(),
             'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             'np': np.random.get_state(),
             'random': random.getstate(),
         },
-        'saved_fields': [k for k in config.__dict__.keys() if k in ['warmup_epochs', 'device', 'batch_size', 'learning_rate', 'weight_decay', 'num_epochs', 'num_workers']],
+        'saved_fields': [k for k in config.__dict__.keys() if k in ['warmup_epochs', 'device', 'batch_size', 'learning_rate', 'weight_decay', 'num_epochs', 'num_workers', 'dataset', 'model_size', 'label_smoothing', 'use_amp', 'ema_decay', 'grad_clip', 'randaug_enabled', 'randaug_n', 'randaug_m', 'use_cutout']],
     }
     
     # Add scheduler if exists
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
     
+    # Add AMP scaler state if provided
+    if scaler is not None:
+        checkpoint['scaler_state_dict'] = scaler.state_dict()
+    
     torch.save(checkpoint, save_path)
     _log_info(f"Checkpoint saved to: {save_path}")
     return save_path
 
 
-def get_latest_checkpoint():
+def get_latest_checkpoint(config):
     """Get the latest checkpoint file."""
-    save_dir = 'checkpoints'
+    save_dir = get_checkpoint_dir(config)
     if not os.path.exists(save_dir):
         return None
     
@@ -66,16 +115,18 @@ def get_latest_checkpoint():
     return checkpoints[0]
 
 
-def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, device=torch.device('cuda')):
+def load_checkpoint(model, checkpoint_path, config=None, optimizer=None, scheduler=None, device=torch.device('cuda'), scaler=None):
     """Load model checkpoint."""
     # Auto-select latest if path is None
     if checkpoint_path is None:
-        latest = get_latest_checkpoint()
+        if config is None:
+            raise ValueError("config must be provided when checkpoint_path is None")
+        latest = get_latest_checkpoint(config)
         if latest:
             _log_info(f"No checkpoint path specified, using latest: {latest}")
             checkpoint_path = latest
         else:
-            raise FileNotFoundError("No checkpoint found in checkpoints directory")
+            raise FileNotFoundError(f"No checkpoint found in {get_checkpoint_dir(config)} directory")
     
     # Check if file exists
     if not os.path.exists(checkpoint_path):
@@ -98,6 +149,11 @@ def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, devi
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         _log_info("Scheduler state loaded")
     
+    # Load AMP scaler state if provided
+    if scaler is not None and 'scaler_state_dict' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        _log_info("AMP scaler state loaded")
+    
     # Restore random states
     if 'random_states' in checkpoint:
         random_states = checkpoint['random_states']
@@ -111,8 +167,11 @@ def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, devi
     history = checkpoint.get('history', {})
     config_dict = checkpoint.get('config', {})
     
-    # Show saved fields
+    # Show saved fields including dataset and model size
     saved_fields = checkpoint.get('saved_fields', [])
+    checkpoint_dataset = checkpoint.get('dataset', 'unknown')
+    checkpoint_model_size = checkpoint.get('model_size', 'unknown')
+    _log_info(f"Checkpoint - Model size: {checkpoint_model_size}, Dataset: {checkpoint_dataset}")
     _log_info(f"Checkpoint contains {len(saved_fields)} saved fields: {saved_fields}")
     
     return {'history': history, 'config': config_dict}
@@ -129,7 +188,7 @@ class Trainer:
         if config.mode == 'resume':
             # Determine checkpoint path
             if config.checkpoint_path is None:
-                config.checkpoint_path = get_latest_checkpoint()
+                config.checkpoint_path = get_latest_checkpoint(config)
                 if config.checkpoint_path:
                     _log_info(f"No checkpoint path specified, using latest: {config.checkpoint_path}")
             
@@ -180,10 +239,52 @@ class Trainer:
                             # Keep the extended value
                         else:
                             _log_info(f"Training duration unchanged: {self.config.num_epochs} epochs")
+                    
+                    # Restore model_size and dataset from checkpoint (if not overridden by cmdline)
+                    # Only restore if cmdline args didn't override
+                    if not hasattr(args, 'model_size') or args.model_size is None:
+                        if 'model_size' in saved_config_dict:
+                            setattr(self.config, 'model_size', saved_config_dict['model_size'])
+                            _log_info(f"Restored model_size from checkpoint: {saved_config_dict['model_size']}")
+                    
+                    if not hasattr(args, 'dataset') or args.dataset is None:
+                        if 'dataset' in saved_config_dict:
+                            setattr(self.config, 'dataset', saved_config_dict['dataset'])
+                            _log_info(f"Restored dataset from checkpoint: {saved_config_dict['dataset']}")
                 else:
                     _log_warning("No configuration found in checkpoint, using current config")
             else:
                 raise RuntimeError("Resume mode requires checkpoint, but none found")
+        
+        # Recalculate dynamic config values (dim, depth, heads, mlp_dim, num_classes)
+        # based on model_size and dataset selections from cmdline or checkpoint
+        _log_info(f"Recalculating model configuration...")
+        
+        # Re-extract model configuration based on size
+        if config.model_size == 'tiny':
+            config.dim = 256
+            config.depth = 4
+            config.heads = 4
+            config.mlp_dim = 256
+        elif config.model_size == 'small':
+            config.dim = 512
+            config.depth = 6
+            config.heads = 8
+            config.mlp_dim = 512
+        elif config.model_size == 'base':
+            config.dim = 768
+            config.depth = 12
+            config.heads = 12
+            config.mlp_dim = 768
+        
+        _log_info(f"  Model size: {config.model_size} -> dim={config.dim}, depth={config.depth}, heads={config.heads}")
+        
+        # Re-set num_classes based on dataset
+        if config.dataset == 'cifar10':
+            config.num_classes = 10
+        elif config.dataset == 'cifar100':
+            config.num_classes = 100
+        _log_info(f"  Dataset: {config.dataset} -> num_classes={config.num_classes}")
         
         # Save random states before creating data loaders
         self.random_states = {
@@ -214,14 +315,45 @@ class Trainer:
         ).to(self.device)
         
         # Data loaders (using restored config values)
-        _log_info(f"Creating data loaders with batch_size={self.config.batch_size}")
-        self.train_loader, self.test_loader = get_cifar10_dataloaders(
+        _log_info(f"Creating data loaders for {config.dataset} with batch_size={self.config.batch_size}")
+        self.train_loader, self.test_loader = get_dataloaders(
+            dataset=config.dataset,
             batch_size=config.batch_size,
-            num_workers=config.num_workers
+            num_workers=config.num_workers,
+            data_dir=config.data_dir,
+            randaug_enabled=config.randaug_enabled,
+            randaug_n=config.randaug_n,
+            randaug_m=config.randaug_m,
+            use_cutout=config.use_cutout,
+            cutout_length=config.cutout_length,
+            use_color_jitter=config.use_color_jitter,
+            color_jitter_brightness=config.color_jitter_brightness,
+            color_jitter_contrast=config.color_jitter_contrast,
+            color_jitter_saturation=config.color_jitter_saturation,
+            color_jitter_hue=config.color_jitter_hue,
+            use_random_rotation=config.use_random_rotation,
+            rotation_degrees=config.rotation_degrees,
+            use_random_affine=config.use_random_affine,
+            affine_translate=config.affine_translate
         )
         
         # Loss and optimizer (using restored config values)
-        self.criterion = nn.CrossEntropyLoss()
+        self.label_smoothing = config.label_smoothing
+        
+        # Create criterion with optional label smoothing
+        kwargs = {}
+        if self.label_smoothing > 0:
+            if hasattr(nn.CrossEntropyLoss, 'label_smoothing'):
+                kwargs['label_smoothing'] = self.label_smoothing
+                _log_info(f"Label smoothing enabled: {self.label_smoothing}")
+            else:
+                _log_warning(f"Label smoothing not supported by this PyTorch version, disabling")
+                _log_warning(f"PyTorch {torch.__version__} detected, requires >= 1.10 for label smoothing")
+                self.label_smoothing = 0.0
+        else:
+            _log_info("Label smoothing disabled")
+            
+        self.criterion = nn.CrossEntropyLoss(**kwargs)
         _log_info(f"Creating optimizer with lr={self.config.learning_rate}, weight_decay={self.config.weight_decay}")
         self.optimizer = optim.AdamW(
             self.model.parameters(),
@@ -271,6 +403,14 @@ class Trainer:
             _log_info(f"Creating CosineAnnealingLR scheduler (no warmup)")
             self.scheduler = CosineAnnealingLR(self.optimizer, T_max=T_max)
         
+        # AMP (Automatic Mixed Precision)
+        self.use_amp = config.use_amp
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False)
+        if self.use_amp:
+            _log_info(f"AMP enabled: {self.use_amp}")
+        else:
+            _log_info("AMP disabled")
+        
         # Training history
         self.history = {
             'train_loss': [],
@@ -279,11 +419,12 @@ class Trainer:
             'test_acc': []
         }
         
-        # Resume: load model, optimizer, scheduler states AFTER they are created
+        
+        # Resume mode: load model, optimizer, scheduler states AFTER they are created
         if config.mode == 'resume' and config.checkpoint_path:
             _log_info(f"Loading model and training states from: {config.checkpoint_path}")
             
-            # Restore random states from checkpoint
+            # Restore random states from checkpoint (already loaded above)
             if 'random_states' in checkpoint:
                 random_states = checkpoint['random_states']
                 torch.set_rng_state(random_states['torch'])
@@ -295,8 +436,9 @@ class Trainer:
             
             # Load model, optimizer, scheduler states
             loaded_data = load_checkpoint(
-                self.model, config.checkpoint_path,
-                self.optimizer, self.scheduler, self.device
+                self.model, config.checkpoint_path, config,
+                self.optimizer, self.scheduler, self.device,
+                scaler=self.scaler
             )
             
             # Restore history
@@ -326,18 +468,70 @@ class Trainer:
             else:
                 _log_info("Model architecture verification passed")
         
+        # Log data augmentation configuration
+        self._log_data_augmentation()
+        
         # Log final configuration summary
         _log_info("=" * 60)
         _log_info("Final configuration for training:")
         _log_info(f"  Mode: {config.mode}")
         _log_info(f"  Device: {self.device}")
+        _log_info(f"  Model size: {config.model_size}")
+        _log_info(f"  Dataset: {config.dataset}")
         _log_info(f"  Epochs: {config.num_epochs}")
         _log_info(f"  Batch size: {config.batch_size}")
-        _log_info(f"  Learning rate: {config.learning_rate}")
         _log_info(f"  Warmup epochs: {config.warmup_epochs}")
         _log_info(f"  Weight decay: {config.weight_decay}")
+        _log_info(f"  Label smoothing: {self.label_smoothing}")
+        _log_info(f"  AMP: {self.use_amp}")
+        _log_info(f"  Gradient clipping: {getattr(config, 'grad_clip', 0.0)}")
         _log_info(f"  Convergence patience: {config.convergence_patience}")
         _log_info("=" * 60)
+    def _log_data_augmentation(self):
+        """Log data augmentation configuration."""
+        config = self.config
+        _log_info("-" * 60)
+        _log_info("Data Augmentation Configuration:")
+        
+        # Basic augmentation
+        _log_info(f"  Basic: RandomCrop(padding=4) + RandomHorizontalFlip")
+        
+        # RandAugment
+        if getattr(config, 'randaug_enabled', False):
+            _log_info(f"  RandAugment: enabled (n={getattr(config, 'randaug_n', 2)}, m={getattr(config, 'randaug_m', 9)})")
+        else:
+            _log_info(f"  RandAugment: disabled")
+        
+        # Cutout
+        if getattr(config, 'use_cutout', False):
+            _log_info(f"  Cutout: enabled (length={getattr(config, 'cutout_length', 16)})")
+        else:
+            _log_info(f"  Cutout: disabled")
+        
+        # Color Jitter
+        if getattr(config, 'use_color_jitter', False):
+            _log_info(f"  ColorJitter: enabled")
+            _log_info(f"    brightness={getattr(config, 'color_jitter_brightness', 0.2)}")
+            _log_info(f"    contrast={getattr(config, 'color_jitter_contrast', 0.2)}")
+            _log_info(f"    saturation={getattr(config, 'color_jitter_saturation', 0.2)}")
+            _log_info(f"    hue={getattr(config, 'color_jitter_hue', 0.1)}")
+        else:
+            _log_info(f"  ColorJitter: disabled")
+        
+        # Rotation
+        if getattr(config, 'use_random_rotation', False):
+            _log_info(f"  RandomRotation: enabled (degrees=±{getattr(config, 'rotation_degrees', 15)})")
+        else:
+            _log_info(f"  RandomRotation: disabled")
+        
+        # Affine
+        if getattr(config, 'use_random_affine', False):
+            _log_info(f"  RandomAffine: enabled (translate={getattr(config, 'affine_translate', 0.1)})")
+        else:
+            _log_info(f"  RandomAffine: disabled")
+        
+        _log_info("-" * 60)
+        
     def check_convergence(self, epoch, test_acc):
         """Double convergence check: accuracy + parameter changes."""
         # Check 1: Accuracy improvement
@@ -373,15 +567,17 @@ class Trainer:
         images, labels = images.to(self.device), labels.to(self.device)
         print(f"Batch loaded successfully! Images shape: {images.shape}, Labels shape: {labels.shape}")
         
-        # Forward pass
-        outputs = self.model(images)
-        loss = self.criterion(outputs, labels)
+        # Forward pass with AMP
+        with torch.cuda.amp.autocast(enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False):
+            outputs = self.model(images)
+            loss = self.criterion(outputs, labels)
         print(f"Forward pass successful! Loss: {loss.item():.4f}")
         
-        # Backward pass
+        # Backward pass with AMP
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         print("Backward pass successful! Weights updated.")
         
         # Test one forward pass
@@ -404,14 +600,25 @@ class Trainer:
         for images, labels in pbar:
             images, labels = images.to(self.device), labels.to(self.device)
             
-            # Forward pass
-            outputs = self.model(images)
-            loss = self.criterion(outputs, labels)
+            # Forward pass with AMP autocast
+            with torch.cuda.amp.autocast(enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False):
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
             
-            # Backward pass
+            # Backward pass with AMP scaler
             self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            
+            # Gradient clipping (if enabled)
+            if hasattr(self.config, 'grad_clip') and self.config.grad_clip > 0:
+                # Unscale gradients before clipping when using AMP
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            
+            # Optimizer step with AMP scaler
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
             self.scheduler.step()
             
             # Statistics
@@ -473,6 +680,7 @@ class Trainer:
         _log_info(f"Initial learning rate: {self.config.learning_rate}")
         _log_info(f"Batch size: {self.config.batch_size}")
         _log_info(f"Warmup epochs: {self.config.warmup_epochs}")
+        _log_info(f"Label smoothing: {self.label_smoothing}")
         
         best_acc = 0.0
         patience_counter = 0
@@ -526,7 +734,8 @@ class Trainer:
                     self.scheduler,
                     self.history,
                     self.config,
-                    filename='vit_cifar10_best'
+                    filename_prefix='best',
+                    scaler=self.scaler
                 )
         
         # Save final model
@@ -539,7 +748,8 @@ class Trainer:
             self.scheduler,
             self.history,
             self.config,
-            filename='vit_cifar10_final'
+            filename_prefix='final',
+            scaler=self.scaler
         )
 
 
@@ -549,10 +759,10 @@ def test_mode(config):
     
     # Auto-select latest checkpoint if not specified
     if config.checkpoint_path is None:
-        config.checkpoint_path = get_latest_checkpoint()
+        config.checkpoint_path = get_latest_checkpoint(config)
     
     if config.checkpoint_path is None:
-        raise RuntimeError("Test mode requires checkpoint, but none found")
+        raise RuntimeError(f"Test mode requires checkpoint, but none found in {get_checkpoint_dir(config)}")
     
     device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
     
@@ -570,20 +780,29 @@ def test_mode(config):
     ).to(device)
     
     # Load checkpoint
-    load_checkpoint(model, config.checkpoint_path, device=device)
+    load_checkpoint(model, config.checkpoint_path, config, device=device)
     
-    # Use training time's test_loader
-    _, test_loader = get_cifar10_dataloaders(
+    # Use training time's test_loader (use loaded dataset config)
+    _, test_loader = get_dataloaders(
+        dataset=config.dataset,
         batch_size=config.batch_size,
-        num_workers=config.num_workers
+        num_workers=config.num_workers,
+        data_dir=config.data_dir,
+        # Note: Test loader uses default transforms (no augmentation)
     )
     
-    # Evaluate
+    # Evaluate (using same criterion as training)
     model.eval()
     test_loss = 0.0
     correct = 0
     total = 0
-    criterion = nn.CrossEntropyLoss()
+    
+    # Create criterion with same label smoothing as training
+    kwargs = {}
+    if config.label_smoothing > 0 and hasattr(nn.CrossEntropyLoss, 'label_smoothing'):
+        kwargs['label_smoothing'] = config.label_smoothing
+    
+    criterion = nn.CrossEntropyLoss(**kwargs)
     
     with torch.no_grad():
         for images, labels in test_loader:
@@ -604,7 +823,7 @@ def test_mode(config):
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Train or test ViT on CIFAR-10')
+    parser = argparse.ArgumentParser(description='Train or test ViT on CIFAR-10/CIFAR-100')
     parser.add_argument('--mode', type=str, default='train', 
                        choices=['dry_run', 'train', 'test', 'resume'],
                        help='Training mode: dry_run, train, test, resume')
@@ -620,6 +839,61 @@ def parse_args():
                        help='Number of warmup epochs')
     parser.add_argument('--weight-decay', type=float, default=None,
                        help='Weight decay')
+    parser.add_argument('--model-size', type=str, default=None, choices=['tiny', 'small', 'base'],
+                       help='Model size: tiny, small, or base')
+    parser.add_argument('--dataset', type=str, default=None, choices=['cifar10', 'cifar100'],
+                       help='Dataset: cifar10 or cifar100')
+    parser.add_argument('--label-smoothing', type=float, default=None,
+                       help='Label smoothing epsilon (0.0 to 0.5, typical 0.1)')
+    
+    # AMP
+    parser.add_argument('--amp', action='store_true', default=None,
+                       help='Enable Automatic Mixed Precision (AMP) training')
+
+    # EMA
+    parser.add_argument('--ema-decay', type=float, default=None,
+                       help='EMA decay rate (0.0=disabled, recommend 0.9999)')
+
+    # Gradient Clipping
+    parser.add_argument('--grad-clip', type=float, default=None,
+                       help='Max gradient norm (0.0=disabled, recommend 1.0)')
+
+    # RandAugment
+    parser.add_argument('--randaug', action='store_true', default=None,
+                       help='Enable RandAugment data augmentation')
+    parser.add_argument('--randaug-n', type=int, default=None,
+                       help='RandAugment: number of transformations')
+    parser.add_argument('--randaug-m', type=int, default=None,
+                       help='RandAugment: magnitude (1-10)')
+
+    # Cutout
+    parser.add_argument('--cutout', action='store_true', default=None,
+                       help='Enable Cutout/RandomErasing augmentation')
+    parser.add_argument('--cutout-length', type=int, default=None,
+                       help='Cutout patch length in pixels')
+    
+    # Color Jitter
+    parser.add_argument('--color-jitter', action='store_true', default=None,
+                       help='Enable ColorJitter augmentation (brightness/contrast/saturation/hue)')
+    parser.add_argument('--color-jitter-brightness', type=float, default=None,
+                       help='ColorJitter brightness jitter range (default 0.2)')
+    parser.add_argument('--color-jitter-contrast', type=float, default=None,
+                       help='ColorJitter contrast jitter range (default 0.2)')
+    parser.add_argument('--color-jitter-saturation', type=float, default=None,
+                       help='ColorJitter saturation jitter range (default 0.2)')
+    parser.add_argument('--color-jitter-hue', type=float, default=None,
+                       help='ColorJitter hue jitter range (default 0.1)')
+    
+    # Geometric augmentation
+    parser.add_argument('--rotation', action='store_true', default=None,
+                       help='Enable random rotation augmentation')
+    parser.add_argument('--rotation-degrees', type=float, default=None,
+                       help='Max rotation degrees (default 15)')
+    parser.add_argument('--affine', action='store_true', default=None,
+                       help='Enable random affine transformation')
+    parser.add_argument('--affine-translate', type=float, default=None,
+                       help='Max translation as fraction of image (default 0.1)')
+    
     parser.add_argument('--verbose', action='store_true', default=None,
                        help='Enable verbose logging')
     parser.add_argument('--debug', action='store_true', default=None,
@@ -655,6 +929,46 @@ if __name__ == "__main__":
         config.warmup_epochs = args.warmup_epochs
     if args.weight_decay is not None:
         config.weight_decay = args.weight_decay
+    if args.model_size is not None:
+        config.model_size = args.model_size
+    if args.dataset is not None:
+        config.dataset = args.dataset
+    if args.label_smoothing is not None:
+        config.label_smoothing = args.label_smoothing
+    if args.amp is not None:
+        config.use_amp = args.amp
+    if args.ema_decay is not None:
+        config.ema_decay = args.ema_decay
+    if args.grad_clip is not None:
+        config.grad_clip = args.grad_clip
+    if args.randaug is not None:
+        config.randaug_enabled = args.randaug
+    if args.randaug_n is not None:
+        config.randaug_n = args.randaug_n
+    if args.randaug_m is not None:
+        config.randaug_m = args.randaug_m
+    if args.cutout is not None:
+        config.use_cutout = args.cutout
+    if args.cutout_length is not None:
+        config.cutout_length = args.cutout_length
+    if args.color_jitter is not None:
+        config.use_color_jitter = args.color_jitter
+    if args.color_jitter_brightness is not None:
+        config.color_jitter_brightness = args.color_jitter_brightness
+    if args.color_jitter_contrast is not None:
+        config.color_jitter_contrast = args.color_jitter_contrast
+    if args.color_jitter_saturation is not None:
+        config.color_jitter_saturation = args.color_jitter_saturation
+    if args.color_jitter_hue is not None:
+        config.color_jitter_hue = args.color_jitter_hue
+    if args.rotation is not None:
+        config.use_random_rotation = args.rotation
+    if args.rotation_degrees is not None:
+        config.rotation_degrees = args.rotation_degrees
+    if args.affine is not None:
+        config.use_random_affine = args.affine
+    if args.affine_translate is not None:
+        config.affine_translate = args.affine_translate
     if args.verbose is not None:
         config.verbose = args.verbose
     if args.debug is not None:
@@ -694,10 +1008,10 @@ if __name__ == "__main__":
             trainer.dry_run()
         elif config.mode == 'test':
             if config.checkpoint_path is None:
-                config.checkpoint_path = get_latest_checkpoint()
+                config.checkpoint_path = get_latest_checkpoint(config)
             
             if config.checkpoint_path is None:
-                raise RuntimeError("Test mode requires checkpoint, but none found")
+                raise RuntimeError(f"Test mode requires checkpoint, but none found in {get_checkpoint_dir(config)}")
             
             test_mode(config)
         else:  # train or resume
