@@ -59,8 +59,10 @@ class Config:
     checkpoint_path = None  # Path to checkpoint for test or resume
     
     # Convergence check (double check)
+    # NOTE: Early stopping is disabled by default to ensure full training.
+    # Set convergence_patience > 0 to enable early stopping.
     convergence_threshold = 0.001  # Accuracy improvement threshold
-    convergence_patience = 5  # Consecutive epochs without improvement
+    convergence_patience = 0  # Consecutive epochs without improvement (0 = disabled)
     param_change_threshold = 1e-6  # Parameter change threshold
     
     # Label smoothing (requires PyTorch >= 1.10, default: disabled)
@@ -114,3 +116,7 @@ class Config:
     # Logging control
     verbose = True  # Enable verbose logging
     debug = False  # Debug logging (default: off)
+    
+    # Multi-GPU training
+    use_multi_gpu = False  # Enable multi-GPU training
+    gpu_ids = None  # GPU IDs to use, e.g., [0, 1, 2, 3]. None means use all available GPUs

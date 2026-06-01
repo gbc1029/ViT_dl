@@ -328,7 +328,7 @@ def get_dataloaders(dataset='cifar10', batch_size=64, num_workers=4, data_dir='.
             use_cutout=use_cutout,
             **kwargs
         )
-        test_transform = get_test_transform(dataset='cifar100')
+        test_transform = get_test_transform(dataset=dataset)
         if dataset == 'cifar10':
             train_dataset = CIFAR10(root=data_dir, train=True, download=False, transform=train_transform)
             test_dataset = CIFAR10(root=data_dir, train=False, download=False, transform=test_transform)

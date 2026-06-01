@@ -1,14 +1,16 @@
 """Training script for Vision Transformer on CIFAR-10 with multiple modes"""
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from torch.nn.parallel import DataParallel
 from tqdm import tqdm
 import argparse
 import os
+import glob
 from datetime import datetime
-from glob import glob
 from data_loader import get_dataloaders, get_dataloaders_with_kornia,KorniaDatasetWrapper,MixUp, KorniaAugmentationPipeline
 import numpy as np
 import random
@@ -18,6 +20,9 @@ from utils import plot_results, count_parameters, visualize_patches
 from utils import _log_info, _log_debug, _log_warning, _log_error, init_logging, get_logger
 import logging
 import sys
+
+# Suppress PyTorch lr_scheduler deprecation warning
+warnings.filterwarnings("ignore", message="The epoch parameter in `scheduler.step()` was not necessary")
 
 
 def get_size_code(model_size):
@@ -47,53 +52,75 @@ def get_checkpoint_dir(config):
     return 'checkpoints/vit'
 
 
-def save_checkpoint(model, optimizer, scheduler, history, config, filename_prefix='', scaler=None):
-    """Save model checkpoint with timestamp."""
-    # Get save directory based on model type
-    save_dir = get_checkpoint_dir(config)
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Get size and dataset codes
-    size_code = get_size_code(config.model_size)
-    dataset_code = get_dataset_code(config.dataset)
-    
-    # Build filename: {size}_{dataset}_{timestamp}.pth
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if filename_prefix:
-        filename = f"{filename_prefix}_{size_code}_{dataset_code}_{timestamp}.pth"
-    else:
-        filename = f"{size_code}_{dataset_code}_{timestamp}.pth"
-    
-    save_path = os.path.join(save_dir, filename)
-    
-    # Prepare checkpoint dict with dataset and model size info
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'history': history,
-        'config': config.__dict__,
-        'dataset': config.dataset,
-        'model_size': config.model_size,
-        'random_states': {
-            'torch': torch.get_rng_state(),
-            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-            'np': np.random.get_state(),
-            'random': random.getstate(),
-        },
-         'saved_fields': [k for k in config.__dict__.keys() if k in ['warmup_epochs', 'device', 'batch_size', 'learning_rate', 'weight_decay', 'num_epochs', 'num_workers', 'dataset', 'model_size', 'label_smoothing', 'use_amp', 'ema_decay', 'grad_clip', 'randaug_enabled', 'randaug_n', 'randaug_m', 'use_cutout', 'use_mixup', 'mixup_alpha', 'mixup_prob', 'drop_path_rate', 'use_kornia']],
-    }
-    
-    # Add scheduler if exists
-    if scheduler is not None:
-        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-    
-    # Add AMP scaler state if provided
-    if scaler is not None:
-        checkpoint['scaler_state_dict'] = scaler.state_dict()
-    
-    torch.save(checkpoint, save_path)
-    _log_info(f"Checkpoint saved to: {save_path}")
-    return save_path
+def save_checkpoint(model, optimizer, scheduler, history, config, filename_prefix='', scaler=None, epoch=None, test_loss=None, test_acc=None, epoch_summary=None):
+    """Save model checkpoint with timestamp and test results."""
+    try:
+        # Get save directory based on model type
+        save_dir = get_checkpoint_dir(config)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Get size and dataset codes
+        size_code = get_size_code(config.model_size)
+        dataset_code = get_dataset_code(config.dataset)
+        
+        # Build filename: {size}_{dataset}_epoch{X}_acc{Y}.pth
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        if filename_prefix:
+            if epoch is not None and test_acc is not None:
+                filename = f"{filename_prefix}_{size_code}_{dataset_code}_epoch{epoch}_acc{test_acc:.2f}_{timestamp}.pth"
+            else:
+                filename = f"{filename_prefix}_{size_code}_{dataset_code}_{timestamp}.pth"
+        else:
+            if epoch is not None and test_acc is not None:
+                filename = f"{size_code}_{dataset_code}_epoch{epoch}_acc{test_acc:.2f}_{timestamp}.pth"
+            else:
+                filename = f"{size_code}_{dataset_code}_{timestamp}.pth"
+        
+        save_path = os.path.join(save_dir, filename)
+        
+        # Prepare checkpoint dict with dataset and model size info
+        checkpoint = {
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'history': history,
+            'config': config.__dict__,
+            'dataset': config.dataset,
+            'model_size': config.model_size,
+            'random_states': {
+                'torch': torch.get_rng_state(),
+                'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                'np': np.random.get_state(),
+                'random': random.getstate(),
+            },
+             'saved_fields': [k for k in config.__dict__.keys() if k in ['warmup_epochs', 'device', 'batch_size', 'learning_rate', 'weight_decay', 'num_epochs', 'num_workers', 'dataset', 'model_size', 'label_smoothing', 'use_amp', 'ema_decay', 'grad_clip', 'randaug_enabled', 'randaug_n', 'randaug_m', 'use_cutout', 'use_mixup', 'mixup_alpha', 'mixup_prob', 'drop_path_rate', 'use_kornia']],
+        }
+        
+        # Add test results
+        if epoch is not None:
+            checkpoint['epoch'] = epoch
+        if test_loss is not None:
+            checkpoint['test_loss'] = test_loss
+        if test_acc is not None:
+            checkpoint['test_acc'] = test_acc
+        if epoch_summary is not None:
+            checkpoint['epoch_summary'] = epoch_summary
+        
+        # Add scheduler if exists
+        if scheduler is not None:
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+        
+        # Add AMP scaler state if provided
+        if scaler is not None:
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
+        
+        torch.save(checkpoint, save_path)
+        _log_info(f"Checkpoint saved to: {save_path}")
+        return save_path
+    except Exception as e:
+        _log_error(f"Error saving checkpoint: {e}")
+        import traceback
+        _log_error(traceback.format_exc())
+        return None
 
 
 def get_latest_checkpoint(config):
@@ -111,7 +138,23 @@ def get_latest_checkpoint(config):
     return checkpoints[0]
 
 
-def load_checkpoint(model, checkpoint_path, config=None, optimizer=None, scheduler=None, device=torch.device('cuda'), scaler=None):
+def delete_old_checkpoint(config, keep_checkpoint_path):
+    """Delete old checkpoint if new one is better."""
+    save_dir = get_checkpoint_dir(config)
+    if not os.path.exists(save_dir):
+        return
+    
+    checkpoints = glob.glob(f"{save_dir}/*.pth")
+    for checkpoint_path in checkpoints:
+        if checkpoint_path != keep_checkpoint_path and 'epoch' in checkpoint_path:
+            try:
+                os.remove(checkpoint_path)
+                _log_info(f"Deleted old checkpoint: {checkpoint_path}")
+            except Exception as e:
+                _log_warning(f"Failed to delete old checkpoint {checkpoint_path}: {e}")
+
+
+def load_checkpoint(model, checkpoint_path, config=None, optimizer=None, scheduler=None, device=torch.device('cuda'), scaler=None, restore_random_states=False):
     """Load model checkpoint."""
     # Auto-select latest if path is None
     if checkpoint_path is None:
@@ -130,7 +173,7 @@ def load_checkpoint(model, checkpoint_path, config=None, optimizer=None, schedul
     
     _log_info(f"Loading checkpoint from: {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Load model state
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -150,15 +193,19 @@ def load_checkpoint(model, checkpoint_path, config=None, optimizer=None, schedul
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         _log_info("AMP scaler state loaded")
     
-    # Restore random states
-    if 'random_states' in checkpoint:
-        random_states = checkpoint['random_states']
-        torch.set_rng_state(random_states['torch'])
-        if random_states['cuda'] is not None:
-            torch.cuda.set_rng_state_all(random_states['cuda'])
-        np.random.set_state(random_states['np'])
-        random.setstate(random_states['random'])
-        _log_info("Random states restored")
+    # Restore random states (only if explicitly requested, for resuming training)
+    if restore_random_states and 'random_states' in checkpoint:
+        try:
+            random_states = checkpoint['random_states']
+            torch.set_rng_state(random_states['torch'])
+            if random_states['cuda'] is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(random_states['cuda'])
+            np.random.set_state(random_states['np'])
+            random.setstate(random_states['random'])
+            _log_info("Random states restored")
+        except Exception as e:
+            _log_warning(f"Could not restore random states: {e}")
+            _log_warning("Continuing without restoring random states")
     
     history = checkpoint.get('history', {})
     config_dict = checkpoint.get('config', {})
@@ -178,7 +225,23 @@ class Trainer:
     
     def __init__(self, config):
         self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
+        # Multi-GPU setup
+        self.use_multi_gpu = getattr(config, 'use_multi_gpu', False)
+        self.gpu_ids = getattr(config, 'gpu_ids', None)
+        
+        if self.use_multi_gpu and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            if self.gpu_ids is not None:
+                self.device = torch.device(f'cuda:{self.gpu_ids[0]}')
+                self.gpu_list = self.gpu_ids
+            else:
+                self.device = torch.device('cuda:0')
+                self.gpu_list = list(range(torch.cuda.device_count()))
+            _log_info(f"Using multi-GPU training on GPUs: {self.gpu_list}")
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
+            self.gpu_list = [0] if torch.cuda.is_available() else []
+            if self.use_multi_gpu and torch.cuda.device_count() <= 1:
+                _log_warning("Multi-GPU requested but only 1 GPU available, using single GPU")
         
         # Handle resume mode: restore configuration from checkpoint FIRST
         if config.mode == 'resume':
@@ -191,7 +254,7 @@ class Trainer:
             if config.checkpoint_path:
                 # Load checkpoint to get saved configuration (without creating model yet)
                 _log_info(f"Loading checkpoint configuration from: {config.checkpoint_path}")
-                checkpoint = torch.load(config.checkpoint_path, map_location='cpu')
+                checkpoint = torch.load(config.checkpoint_path, map_location='cpu', weights_only=False)
                 saved_config_dict = checkpoint.get('config', {})
                 
                 # Restore saved configuration
@@ -310,6 +373,11 @@ class Trainer:
             emb_dropout=config.emb_dropout,
             drop_path_rate=getattr(config, 'drop_path_rate', 0.0)
         ).to(self.device)
+        
+        # Wrap model with DataParallel for multi-GPU training
+        if self.use_multi_gpu and len(self.gpu_list) > 1:
+            self.model = DataParallel(self.model, device_ids=self.gpu_list)
+            _log_info(f"Model wrapped with DataParallel on GPUs: {self.gpu_list}")
         
         # Data loaders (using restored config values)
         _log_info(f"Creating data loaders for {config.dataset} with batch_size={self.config.batch_size}")
@@ -467,21 +535,12 @@ class Trainer:
         if config.mode == 'resume' and config.checkpoint_path:
             _log_info(f"Loading model and training states from: {config.checkpoint_path}")
             
-            # Restore random states from checkpoint (already loaded above)
-            if 'random_states' in checkpoint:
-                random_states = checkpoint['random_states']
-                torch.set_rng_state(random_states['torch'])
-                if random_states['cuda'] is not None:
-                    torch.cuda.set_rng_state_all(random_states['cuda'])
-                np.random.set_state(random_states['np'])
-                random.setstate(random_states['random'])
-                _log_info("Random states restored from checkpoint")
-            
-            # Load model, optimizer, scheduler states
+            # Load model, optimizer, scheduler states and restore random states
             loaded_data = load_checkpoint(
                 self.model, config.checkpoint_path, config,
                 self.optimizer, self.scheduler, self.device,
-                scaler=self.scaler
+                scaler=self.scaler,
+                restore_random_states=True
             )
             
             # Restore history
@@ -529,6 +588,7 @@ class Trainer:
         _log_info(f"  AMP: {self.use_amp}")
         _log_info(f"  Gradient clipping: {getattr(config, 'grad_clip', 0.0)}")
         _log_info(f"  Convergence patience: {config.convergence_patience}")
+        _log_info(f"  Multi-GPU: {self.use_multi_gpu} (GPUs: {self.gpu_list})")
         _log_info("=" * 60)
     def _log_data_augmentation(self):
         """Log data augmentation configuration."""
@@ -582,7 +642,15 @@ class Trainer:
         _log_info("-" * 60)
         
     def check_convergence(self, epoch, test_acc):
-        """Double convergence check: accuracy + parameter changes."""
+        """Double convergence check: accuracy + parameter changes.
+        
+        Returns True if training should stop early, False otherwise.
+        Early stopping is disabled if convergence_patience <= 0.
+        """
+        # Early stopping is disabled
+        if self.config.convergence_patience <= 0:
+            return False
+        
         # Check 1: Accuracy improvement
         if len(self.history['test_acc']) >= self.config.convergence_patience:
             recent_acc = self.history['test_acc'][-self.config.convergence_patience:]
@@ -644,9 +712,9 @@ class Trainer:
         correct = 0
         total = 0
         
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config.num_epochs}')
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config.num_epochs}', mininterval=0.5)
         
-        for images, labels in pbar:
+        for batch_idx, (images, labels) in enumerate(pbar):
             images, labels = images.to(self.device,non_blocking=True), labels.to(self.device,non_blocking=True)
             mixup_applied = False
             
@@ -729,7 +797,7 @@ class Trainer:
         total = 0
         
         with torch.no_grad():
-            for images, labels in tqdm(self.test_loader, desc='Testing'):
+            for images, labels in tqdm(self.test_loader, desc='Testing', leave=False, mininterval=0.5):
                 images, labels = images.to(self.device), labels.to(self.device)
                 
                 # Apply AMP autocast (optional)
@@ -756,86 +824,148 @@ class Trainer:
 
     
     def train(self):
-        """Main training loop."""
+        """Main training loop with optimized checkpoint strategy."""
         _log_info(f"Training on device: {self.device}")
         _log_info(f"Model: Vision Transformer")
-        _log_info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()) / 1e6:.2f}M")
+        # Handle DataParallel wrapper for parameter counting
+        model_for_count = self.model.module if hasattr(self.model, 'module') else self.model
+        _log_info(f"Model parameters: {sum(p.numel() for p in model_for_count.parameters()) / 1e6:.2f}M")
         _log_info(f"Training samples: {len(self.train_loader.dataset)}")
         _log_info(f"Test samples: {len(self.test_loader.dataset)}")
         _log_info(f"Initial learning rate: {self.config.learning_rate}")
         _log_info(f"Batch size: {self.config.batch_size}")
         _log_info(f"Warmup epochs: {self.config.warmup_epochs}")
         _log_info(f"Label smoothing: {self.label_smoothing}")
+        if self.use_multi_gpu and len(self.gpu_list) > 1:
+            _log_info(f"Multi-GPU training enabled on GPUs: {self.gpu_list}")
         
+        # Track best model
         best_acc = 0.0
+        best_checkpoint_path = None
+        best_epoch = None
         patience_counter = 0
         
         # If resuming, start from current epoch
         start_epoch = len(self.history['train_loss'])
         
         _log_info(f"Starting training from epoch {start_epoch + 1} to {self.config.num_epochs}")
+        _log_info(f"Testing & saving checkpoint every 10 epochs\n")
         
         for epoch in range(start_epoch, self.config.num_epochs):
-            _log_info(f"\n{'='*60}")
-            _log_info(f"Epoch {epoch+1}/{self.config.num_epochs}")
-            _log_info(f"{'='*60}")
-            
             # Train
             train_loss, train_acc = self.train_epoch(epoch)
             
-            # Evaluate
-            test_loss, test_acc = self.evaluate()
+            # Only test and save every 10 epochs
+            is_checkpoint_epoch = (epoch + 1) % 10 == 0
             
-            _log_info(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            _log_info(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
-            
-            # Check convergence
-            if self.check_convergence(epoch, test_acc):
-                _log_info(f"Early stopping: Training converged at epoch {epoch+1}")
-                _log_info(f"Final test accuracy: {test_acc:.2f}%")
-                _log_info(f"Best test accuracy: {best_acc:.2f}%")
-                break
-            
-            # Check patience
-            if test_acc > best_acc:
-                patience_counter = 0
+            if is_checkpoint_epoch:
+                # Evaluate
+                test_loss, test_acc = self.evaluate()
+                
+                # Print detailed summary to console (not just log file)
+                print(f"\n{'='*60}")
+                print(f"CHECKPOINT EPOCH {epoch+1}/{self.config.num_epochs}")
+                print(f"{'='*60}")
+                print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+                print(f"  Test Loss:  {test_loss:.4f} | Test Acc:  {test_acc:.2f}%")
+                print(f"  LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+                _log_info(f"CHECKPOINT EPOCH {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, Test Loss={test_loss:.4f}, Test Acc={test_acc:.2f}%")
+                
+                # Update best model info
+                if test_acc > best_acc:
+                    best_acc = test_acc
+                    best_epoch = epoch + 1
+                    print(f"  ✓ NEW BEST MODEL!")
+                else:
+                    print(f"  Best so far: Epoch {best_epoch if best_epoch else 'N/A'}, Acc: {best_acc:.2f}%")
+                
+                # Save checkpoint
+                print(f"\n  Saving checkpoint...")
+                try:
+                    # Unwrap DataParallel before saving to ensure compatibility with single-GPU loading
+                    model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+                    
+                    # Check if this is better than current best
+                    if test_acc == best_acc and (epoch + 1) == best_epoch:
+                        # Delete old checkpoint before saving new one
+                        if best_checkpoint_path is not None:
+                            delete_old_checkpoint(self.config, best_checkpoint_path)
+                        
+                        # Save new best checkpoint
+                        best_checkpoint_path = save_checkpoint(
+                            model_to_save,
+                            self.optimizer,
+                            self.scheduler,
+                            self.history,
+                            self.config,
+                            filename_prefix='best',
+                            scaler=self.scaler,
+                            epoch=epoch + 1,
+                            test_loss=test_loss,
+                            test_acc=test_acc
+                        )
+                        print(f"  ✓ BEST CHECKPOINT SAVED!")
+                        _log_info(f"  Best checkpoint saved: {best_checkpoint_path}")
+                    else:
+                        # Save as normal checkpoint (not best)
+                        checkpoint_path = save_checkpoint(
+                            model_to_save,
+                            self.optimizer,
+                            self.scheduler,
+                            self.history,
+                            self.config,
+                            filename_prefix='checkpoint',
+                            scaler=self.scaler,
+                            epoch=epoch + 1,
+                            test_loss=test_loss,
+                            test_acc=test_acc
+                        )
+                        print(f"  ✓ Checkpoint saved!")
+                        _log_info(f"  Checkpoint saved: {checkpoint_path}")
+                except Exception as e:
+                    print(f"  ✗ Failed to save checkpoint: {e}")
+                    _log_error(f"Failed to save checkpoint: {e}")
             else:
-                patience_counter += 1
-                _log_info(f"Convergence patience counter: {patience_counter}/{self.config.convergence_patience}")
-            
-            if patience_counter >= self.config.convergence_patience:
-                _log_info(f"Early stopping: No improvement for {self.config.convergence_patience} epochs")
-                _log_info(f"Final test accuracy: {test_acc:.2f}%")
-                _log_info(f"Best test accuracy: {best_acc:.2f}%")
-                break
-            
-            # Save best model
-            if test_acc > best_acc:
-                best_acc = test_acc
-                _log_info(f"New best model! Test accuracy: {best_acc:.2f}%")
-                save_checkpoint(
-                    self.model,
-                    self.optimizer,
-                    self.scheduler,
-                    self.history,
-                    self.config,
-                    filename_prefix='best',
-                    scaler=self.scaler
-                )
+                # Just print simple progress every epoch to console
+                current_lr = self.optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch+1}/{self.config.num_epochs}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, LR={current_lr:.6f}", flush=True)
+                _log_info(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%")
         
-        # Save final model
-        _log_info(f"\n{'='*60}")
-        _log_info("Training completed or stopped early")
-        _log_info(f"Best test accuracy: {best_acc:.2f}%")
-        save_checkpoint(
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.history,
-            self.config,
-            filename_prefix='final',
-            scaler=self.scaler
-        )
+        # Training completed - save final checkpoint and print summary
+        
+        # Save final checkpoint
+        try:
+            model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+            # Evaluate one last time for final checkpoint
+            final_test_loss, final_test_acc = self.evaluate()
+            save_checkpoint(
+                model_to_save,
+                self.optimizer,
+                self.scheduler,
+                self.history,
+                self.config,
+                filename_prefix='final',
+                scaler=self.scaler,
+                epoch=self.config.num_epochs,
+                test_loss=final_test_loss,
+                test_acc=final_test_acc
+            )
+        except Exception as e:
+            _log_error(f"Failed to save final checkpoint: {e}")
+        
+        # Output final summary to console
+        print(f"\n{'='*60}")
+        print("FINAL TRAINING SUMMARY")
+        print(f"{'='*60}")
+        print(f"Total epochs: {len(self.history['train_loss'])}")
+        print(f"Best model: Epoch {best_epoch}, Test Acc: {best_acc:.2f}%")
+        if best_checkpoint_path is not None:
+            print(f"Best checkpoint path: {best_checkpoint_path}")
+        else:
+            print(f"No checkpoint saved (no 10-epoch mark reached)")
+        print(f"{'='*60}")
+        
+        _log_info(f"Training completed! Total epochs={len(self.history['train_loss'])}, Best acc={best_acc:.2f}% (epoch {best_epoch})")
 
 
 def test_mode(config):
@@ -848,6 +978,8 @@ def test_mode(config):
     
     if config.checkpoint_path is None:
         raise RuntimeError(f"Test mode requires checkpoint, but none found in {get_checkpoint_dir(config)}")
+    
+    _log_info(f"Using checkpoint: {config.checkpoint_path}")
     
     device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
     
@@ -1007,6 +1139,13 @@ def parse_args():
                        help='Enable verbose logging')
     parser.add_argument('--debug', action='store_true', default=False,
                        help='Enable debug logging')
+    
+    # Multi-GPU training
+    parser.add_argument('--multi-gpu', action='store_true', default=False,
+                       help='Enable multi-GPU training with DataParallel')
+    parser.add_argument('--gpu-ids', type=str, default=None,
+                       help='GPU IDs to use for multi-GPU training, e.g., "0,1,2,3". Default: use all available GPUs')
+    
     return parser.parse_args()
 
 
@@ -1024,6 +1163,16 @@ if __name__ == "__main__":
     config.model_size = args.model_size or config.model_size
     config.num_epochs = args.epochs or config.num_epochs
     config.batch_size = args.batch_size or config.batch_size
+    
+    # Checkpoint path
+    if args.checkpoint is not None:
+        config.checkpoint_path = args.checkpoint
+    
+    # Multi-GPU args
+    if args.multi_gpu:
+        config.use_multi_gpu = True
+    if args.gpu_ids is not None:
+        config.gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(',')]
     
     # Initialize logging BEFORE creating trainer
     force_new_log = (config.mode != 'resume')

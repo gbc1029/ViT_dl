@@ -10,3 +10,4 @@ save_path_100 = "./data/cifar-100-batches-py.tar.gz"
 urllib.request.urlretrieve(url_100, save_path_100)
 print("CIFAR-100 dataset downloaded successfully.")
 
+
