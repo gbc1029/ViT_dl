@@ -102,7 +102,7 @@ def get_latest_checkpoint(config):
     if not os.path.exists(save_dir):
         return None
     
-    checkpoints = glob.glob(f"{save_dir}/*.pth")
+    checkpoints = glob(f"{save_dir}/*.pth")
     if not checkpoints:
         return None
     
@@ -130,7 +130,7 @@ def load_checkpoint(model, checkpoint_path, config=None, optimizer=None, schedul
     
     _log_info(f"Loading checkpoint from: {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device,weights_only=False)
     
     # Load model state
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -153,12 +153,125 @@ def load_checkpoint(model, checkpoint_path, config=None, optimizer=None, schedul
     # Restore random states
     if 'random_states' in checkpoint:
         random_states = checkpoint['random_states']
-        torch.set_rng_state(random_states['torch'])
-        if random_states['cuda'] is not None:
-            torch.cuda.set_rng_state_all(random_states['cuda'])
-        np.random.set_state(random_states['np'])
-        random.setstate(random_states['random'])
-        _log_info("Random states restored")
+        
+        # 修复 torch RNG state
+        if 'torch' in random_states:
+            torch_state = random_states['torch']
+            # 检查并转换类型
+            if not isinstance(torch_state, torch.ByteTensor):
+                print(f"Warning: torch RNG state is not ByteTensor (type={type(torch_state)}), attempting to convert")
+                try:
+                    # 尝试转换为 ByteTensor
+                    if isinstance(torch_state, (list, tuple)):
+                        torch_state = torch.ByteTensor(torch_state)
+                        print("Successfully converted torch RNG state from list/tuple to ByteTensor")
+                    elif isinstance(torch_state, torch.Tensor):
+                        torch_state = torch_state.byte()
+                        print("Successfully converted torch RNG state from Tensor to ByteTensor")
+                    else:
+                        _log_warning(f"Unknown torch RNG state type: {type(torch_state)}, skipping restore")
+                        torch_state = None
+                    # 确保在CPU上（RNG状态总是在CPU上）
+                    if torch_state.device.type != 'cpu':
+                        torch_state = torch_state.cpu()
+                        _log_info("Moved to CPU")
+                    
+                    # 确保内存连续
+                    if not torch_state.is_contiguous():
+                        torch_state = torch_state.contiguous()
+                        _log_info("Made contiguous")
+                    
+                    # 检查shape是否匹配
+                    current_state = torch.get_rng_state()
+                    if torch_state.shape != current_state.shape:
+                        _log_warning(f"Shape mismatch: saved {torch_state.shape}, expected {current_state.shape}")
+                        _log_info("Attempting to use saved state anyway...")
+
+                except Exception as e:
+                    _log_warning(f"Failed to convert torch RNG state: {e}, skipping restore")
+                    torch_state = None
+            
+            if torch_state is not None:
+                try:
+                    torch.set_rng_state(torch_state)
+                    _log_info("Torch RNG state restored")
+                    print(f"Torch RNG state restored")
+                except Exception as e:
+                    _log_warning(f"Failed to restore torch RNG state: {e}")
+        
+        # 修复 CUDA RNG state
+        if 'cuda' in random_states and random_states['cuda'] is not None:
+            cuda_states = random_states['cuda']
+            if torch.cuda.is_available() and cuda_states:
+                try:
+                    num_devices = torch.cuda.device_count()
+                    current_states = torch.cuda.get_rng_state_all()
+                    
+                    _log_info(f"CUDA devices available: {num_devices}")
+                    _log_info(f"Saved states count: {len(cuda_states)}")
+                    _log_info(f"Current states count: {len(current_states)}")
+                    
+                    # Check if count matches
+                    if len(cuda_states) != num_devices:
+                        _log_warning(f"Device count mismatch: saved {len(cuda_states)}, current {num_devices}")
+                        _log_info("Attempting to restore only available devices...")
+                    
+                    
+                    # 确保每个状态都是正确的格式
+                    fixed_states = []
+                    for state in cuda_states:
+                        if not isinstance(state, torch.ByteTensor):
+                            if isinstance(state, torch.Tensor):
+                                state = state.byte()
+                                print("Successfully converted a CUDA RNG state from Tensor to ByteTensor")
+                            elif isinstance(state, (list, tuple)):
+                                state = torch.ByteTensor(state)
+                                print("Successfully converted a CUDA RNG state from list/tuple to ByteTensor")
+                        
+                        if state.dtype != torch.uint8:
+                            _log_info(f"Converting dtype from {state.dtype} to uint8")
+                            state = state.byte()
+                        
+                        if state.device.type != 'cpu':
+                            _log_info(f"Moving from {state.device} to CPU")
+                            state = state.cpu()
+
+                        # Check 4: Ensure contiguous memory layout
+                        if not state.is_contiguous():
+                            _log_info("Making tensor contiguous")
+                            state = state.contiguous()
+                        
+                        # Check 5: Compare shape with reference
+                        ref_state = current_states[fixed_states.__len__()] if fixed_states.__len__() < len(current_states) else None
+                        if ref_state is not None and state.shape != ref_state.shape:
+                            _log_warning(f"Shape mismatch: saved {state.shape}, expected {ref_state.shape}")
+                            _log_info("Attempting to use saved state anyway...")
+                            
+                        fixed_states.append(state)
+                    torch.cuda.set_rng_state_all(fixed_states)
+                    _log_info("CUDA RNG state restored")
+                    
+
+
+
+                except Exception as e:
+                    _log_warning(f"Failed to restore CUDA RNG state: {e}")
+        
+        # 恢复 numpy random state
+        if 'np' in random_states:
+            try:
+                np.random.set_state(random_states['np'])
+                _log_info("NumPy RNG state restored")
+            except Exception as e:
+                _log_warning(f"Failed to restore NumPy RNG state: {e}")
+        
+        # 恢复 python random state
+        if 'random' in random_states:
+            try:
+                random.setstate(random_states['random'])
+                _log_info("Python random state restored")
+            except Exception as e:
+                _log_warning(f"Failed to restore Python random state: {e}")
     
     history = checkpoint.get('history', {})
     config_dict = checkpoint.get('config', {})
@@ -530,6 +643,7 @@ class Trainer:
         _log_info(f"  Gradient clipping: {getattr(config, 'grad_clip', 0.0)}")
         _log_info(f"  Convergence patience: {config.convergence_patience}")
         _log_info("=" * 60)
+    
     def _log_data_augmentation(self):
         """Log data augmentation configuration."""
         config = self.config
@@ -754,7 +868,6 @@ class Trainer:
         
         return avg_loss, avg_acc
 
-    
     def train(self):
         """Main training loop."""
         _log_info(f"Training on device: {self.device}")
@@ -851,7 +964,12 @@ def test_mode(config):
     
     device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
     
-    # Load model (create new instance with same architecture)
+    checkpoint = torch.load(config.checkpoint_path, map_location='cpu',weights_only=False)
+    checkpoint_path = config.checkpoint_path
+    config = Config.from_dict(checkpoint.get('config', {}))
+    print(config)
+
+    #使用checkpoint中的配置创建模型（确保与训练时一致）
     model = VisionTransformer(
         img_size=config.image_size,
         patch_size=config.patch_size,
@@ -866,7 +984,7 @@ def test_mode(config):
     ).to(device)
     
     # Load checkpoint
-    load_checkpoint(model, config.checkpoint_path, config, device=device)
+    load_checkpoint(model, checkpoint_path, config, device=device)
     
     # Use training time's test_loader (use loaded dataset config)
     _, test_loader = get_dataloaders(
