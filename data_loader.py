@@ -126,10 +126,9 @@ class KorniaAugmentationPipeline:
         
         # RandAugment (replaces ColorJitter)
         if randaug_enabled:
-            self.randaug = K.RandAugment(
-                num_ops=randaug_n,
-                magnitude=randaug_m,
-                same_on_batch=False
+            self.randaug = K.auto.RandAugment(
+                n=randaug_n,
+                m=randaug_m
             )
         else:
             self.randaug = None
