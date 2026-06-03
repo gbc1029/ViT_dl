@@ -12,23 +12,11 @@ from datetime import datetime
 import numpy as np
 import random
 import inspect
-
 from model import resnet_tiny, resnet_small
 from data_loader import get_dataloaders, get_dataloaders_with_kornia, MixUp
 from config import Config
-
-# ── Logging helpers ──────────────────────────────────────────────
-
-def _log_info(msg):
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - {msg}")
-
-def _log_warning(msg):
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - WARNING - {msg}")
-
-def _log_error(msg):
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - ERROR - {msg}")
-
-
+import logging
+from utils import init_logging, _log_info, _log_warning, _log_error
 # ── Checkpoint helpers ───────────────────────────────────────────
 
 def get_checkpoint_dir(config):
@@ -200,25 +188,46 @@ class ResNetTrainer:
             _log_info("Label smoothing disabled")
         self.criterion = nn.CrossEntropyLoss(**kwargs)
 
-        # Optimizer (SGD for ResNet)
-        _log_info(f"Creating SGD optimizer: lr={config.learning_rate}, momentum={config.momentum}, weight_decay={config.weight_decay}")
-        self.optimizer = optim.SGD(
+        # Optimizer (AdamW, same as ViT for fair comparison)
+        _log_info(f"Creating AdamW optimizer: lr={config.learning_rate}, weight_decay={config.weight_decay}")
+        self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
-            momentum=config.momentum,
-            weight_decay=config.weight_decay,
-            nesterov=True)
+            weight_decay=config.weight_decay)
 
-        # LR scheduler (MultiStep for ResNet)
-        _log_info(f"MultiStepLR scheduler: milestones={config.lr_milestones}, gamma={config.lr_gamma}")
-        self.scheduler = MultiStepLR(self.optimizer, milestones=config.lr_milestones, gamma=config.lr_gamma)
+        # LR scheduler: CosineAnnealing with warmup (same as ViT)
+        self.warmup_epochs = getattr(config, 'warmup_epochs', 5)
+        n_batches = len(self.train_loader)
+        total_iters = n_batches * max(1, config.num_epochs)
+        T_max = max(1, total_iters)
+        
+        if self.warmup_epochs > 0 and self.warmup_epochs < config.num_epochs:
+            warmup_iters = n_batches * self.warmup_epochs
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=1e-4,
+                end_factor=1.0,
+                total_iters=warmup_iters
+            )
+            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=T_max - warmup_iters
+            )
+            self.scheduler = optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_iters]
+            )
+            _log_info(f"SequentialLR scheduler: warmup={self.warmup_epochs}ep, cosine T_max={T_max - warmup_iters}")
+        else:
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=T_max)
+            _log_info(f"CosineAnnealingLR scheduler (no warmup), T_max={T_max}")
+
 
         # AMP
         self.use_amp = config.use_amp
         if hasattr(torch.amp, 'GradScaler'):
             self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp and torch.cuda.is_available() and str(self.device) != 'cpu')
-        else:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp and torch.cuda.is_available() and str(self.device) != 'cpu')
         if self.use_amp:
             _log_info("AMP enabled")
         else:
@@ -279,7 +288,7 @@ class ResNetTrainer:
 
     # ── Dry Run ──
     def dry_run(self):
-        print("Starting dry run...")
+        _log_info("Starting dry run...")
         self.model.train()
         images, labels = next(iter(self.train_loader))
         images, labels = images.to(self.device), labels.to(self.device)
@@ -288,15 +297,15 @@ class ResNetTrainer:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        print(f"Dry run successful!")
-        print(f"  Loss: {loss.item():.4f}")
-        print(f"  Output shape: {outputs.shape}")
+        _log_info(f"Dry run successful!")
+        _log_info(f"  Loss: {loss.item():.4f}")
+        _log_info(f"  Output shape: {outputs.shape}")
         self.model.eval()
         with torch.no_grad():
             outputs = self.model(images)
             _, predicted = outputs.max(1)
             acc = (predicted == labels).sum().item() / labels.size(0)
-            print(f"  Accuracy: {100 * acc:.2f}%")
+            _log_info(f"  Accuracy: {100 * acc:.2f}%")
 
     # ── Train Epoch ──
     def train_epoch(self, epoch):
@@ -332,6 +341,9 @@ class ResNetTrainer:
 
             # EMA update per step
             self._ema_update()
+
+            # Scheduler step per iteration (SequentialLR needs per-batch stepping)
+            self.scheduler.step()
 
             train_loss += loss.item()
             if mixup_applied:
@@ -379,35 +391,34 @@ class ResNetTrainer:
 
     # ── Train Loop ──
     def train(self):
-        print(f"\nTraining on device: {self.device}")
-        print(f"Model: {self.config.model_type}")
+        _log_info(f"\nTraining on device: {self.device}")
+        _log_info(f"Model: {self.config.model_type}")
         total_params = sum(p.numel() for p in self.model.parameters())
-        print(f"Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-        print(f"Training samples: {len(self.train_loader.dataset)}")
-        print(f"Test samples: {len(self.test_loader.dataset)}")
-        print(f"Number of epochs: {self.config.num_epochs}")
-        print(f"Batch size: {self.config.batch_size}")
-        print("─" * 50)
+        _log_info(f"Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+        _log_info(f"Training samples: {len(self.train_loader.dataset)}")
+        _log_info(f"Test samples: {len(self.test_loader.dataset)}")
+        _log_info(f"Number of epochs: {self.config.num_epochs}")
+        _log_info(f"Batch size: {self.config.batch_size}")
+        _log_info("─" * 50)
 
         best_acc = 0.0
         start_epoch = len(self.history['train_loss'])
 
         for epoch in range(start_epoch, self.config.num_epochs):
             train_loss, train_acc = self.train_epoch(epoch)
-            self.scheduler.step()
             test_loss, test_acc = self.evaluate()
 
-            print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
-            print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
-            print("─" * 50)
+            _log_info(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
+            _log_info(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            _log_info(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
+            _log_info("─" * 50)
 
             if test_acc > best_acc:
                 best_acc = test_acc
                 self.save_model(f'best_resnet.pth')
 
         self.save_model(f'final_resnet.pth')
-        print(f"\nTraining completed! Best test accuracy: {best_acc:.2f}%")
+        _log_info(f"\nTraining completed! Best test accuracy: {best_acc:.2f}%")
         return self.history
 
     def save_model(self, filename='checkpoint.pth'):
@@ -420,9 +431,9 @@ class ResNetTrainer:
 # ── Test Mode ────────────────────────────────────────────────────
 
 def test_mode(config):
-    print("Testing mode...")
+    _log_info("Testing mode...")
     if not config.checkpoint_path:
-        print("Error: checkpoint_path must be specified")
+        _log_info("Error: checkpoint_path must be specified")
         return
 
     device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
@@ -453,9 +464,9 @@ def test_mode(config):
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
-    print(f"\nTest Results:")
-    print(f"  Loss: {test_loss / len(test_loader):.4f}")
-    print(f"  Accuracy: {100. * correct / total:.2f}%")
+    _log_info(f"\nTest Results:")
+    _log_info(f"  Loss: {test_loss / len(test_loader):.4f}")
+    _log_info(f"  Accuracy: {100. * correct / total:.2f}%")
 
 # ── CLI ──────────────────────────────────────────────────────────
 
@@ -472,6 +483,8 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=None, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=None, help='Batch size')
     parser.add_argument('--lr', type=float, default=None, help='Learning rate')
+    parser.add_argument('--warmup-epochs', type=int, default=None, help='Warmup epochs')
+    parser.add_argument('--weight-decay', type=float, default=None, help='Weight decay')
     parser.add_argument('--dataset', type=str, default=None, choices=['cifar10', 'cifar100'])
     parser.add_argument('--label-smoothing', type=float, default=None)
 
@@ -484,16 +497,21 @@ def parse_args():
     # Gradient Clipping
     parser.add_argument('--grad-clip', type=float, default=None)
 
-    # Data Augmentation
+# Data Augmentation
     parser.add_argument('--randaug', action='store_true', default=None)
     parser.add_argument('--randaug-n', type=int, default=None)
     parser.add_argument('--randaug-m', type=int, default=None)
     parser.add_argument('--cutout', action='store_true', default=None)
     parser.add_argument('--cutout-length', type=int, default=None)
     parser.add_argument('--color-jitter', action='store_true', default=None)
+    parser.add_argument('--color-jitter-brightness', type=float, default=None)
+    parser.add_argument('--color-jitter-contrast', type=float, default=None)
+    parser.add_argument('--color-jitter-saturation', type=float, default=None)
+    parser.add_argument('--color-jitter-hue', type=float, default=None)
     parser.add_argument('--rotation', action='store_true', default=None)
     parser.add_argument('--rotation-degrees', type=float, default=None)
     parser.add_argument('--affine', action='store_true', default=None)
+    parser.add_argument('--affine-translate', type=float, default=None)
 
     # MixUp
     parser.add_argument('--mixup', action='store_true', default=None)
@@ -501,6 +519,7 @@ def parse_args():
     parser.add_argument('--mixup-prob', type=float, default=None)
 
     # Other
+    parser.add_argument('--kornia', action='store_true', default=None)
     parser.add_argument('--verbose', action='store_true', default=None)
     parser.add_argument('--debug', action='store_true', default=None)
 
@@ -520,6 +539,8 @@ if __name__ == "__main__":
         'num_epochs': args.epochs,
         'batch_size': args.batch_size,
         'learning_rate': args.lr,
+        'warmup_epochs': args.warmup_epochs,
+        'weight_decay': args.weight_decay,
         'label_smoothing': args.label_smoothing,
         'use_amp': args.amp,
         'ema_decay': args.ema_decay,
@@ -530,12 +551,18 @@ if __name__ == "__main__":
         'use_cutout': args.cutout,
         'cutout_length': args.cutout_length,
         'use_color_jitter': args.color_jitter,
+        'color_jitter_brightness': args.color_jitter_brightness,
+        'color_jitter_contrast': args.color_jitter_contrast,
+        'color_jitter_saturation': args.color_jitter_saturation,
+        'color_jitter_hue': args.color_jitter_hue,
         'use_random_rotation': args.rotation,
         'rotation_degrees': args.rotation_degrees,
         'use_random_affine': args.affine,
+        'affine_translate': args.affine_translate,
         'use_mixup': args.mixup,
         'mixup_alpha': args.mixup_alpha,
         'mixup_prob': args.mixup_prob,
+        'use_kornia': args.kornia,
         'verbose': args.verbose,
         'debug': args.debug,
     }
@@ -543,28 +570,33 @@ if __name__ == "__main__":
         if val is not None and hasattr(config, key):
             setattr(config, key, val)
 
-    config.num_classes = 10 if config.dataset == 'cifar10' else 100
+    init_logging(
+        verbose=getattr(config, 'verbose', True),
+        debug=getattr(config, 'debug', False),
+        log_dir='logs',
+        console_level=logging.INFO
+    )
 
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
+    _log_info(f"PyTorch version: {torch.__version__}")
+    _log_info(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
-        print(f"CUDA version: {torch.version.cuda}")
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        _log_info(f"CUDA version: {torch.version.cuda}")
+        _log_info(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    print(f"\nConfiguration:")
-    print(f"  Model: {config.model_type}")
-    print(f"  Dataset: {config.dataset} -> num_classes={config.num_classes}")
-    print(f"  Mode: {config.mode}")
-    print(f"  Epochs: {config.num_epochs}")
-    print(f"  Batch size: {config.batch_size}")
-    print(f"  Learning rate: {config.learning_rate}")
-    print(f"  AMP: {config.use_amp}")
-    print(f"  EMA decay: {config.ema_decay}")
-    print(f"  Grad clip: {config.grad_clip}")
-    print(f"  Label smoothing: {config.label_smoothing}")
-    print(f"  RandAugment: {config.randaug_enabled}")
-    print(f"  Cutout: {config.use_cutout}")
-    print(f"  MixUp: {config.use_mixup}")
+    _log_info(f"\nConfiguration:")
+    _log_info(f"  Model: {config.model_type}")
+    _log_info(f"  Dataset: {config.dataset} -> num_classes={config.num_classes}")
+    _log_info(f"  Mode: {config.mode}")
+    _log_info(f"  Epochs: {config.num_epochs}")
+    _log_info(f"  Batch size: {config.batch_size}")
+    _log_info(f"  Learning rate: {config.learning_rate}")
+    _log_info(f"  AMP: {config.use_amp}")
+    _log_info(f"  EMA decay: {config.ema_decay}")
+    _log_info(f"  Grad clip: {config.grad_clip}")
+    _log_info(f"  Label smoothing: {config.label_smoothing}")
+    _log_info(f"  RandAugment: {config.randaug_enabled}")
+    _log_info(f"  Cutout: {config.use_cutout}")
+    _log_info(f"  MixUp: {config.use_mixup}")
 
     if config.mode == 'test':
         test_mode(config)

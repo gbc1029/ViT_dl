@@ -11,12 +11,11 @@ class Config:
         # Number of classes is derived from dataset
         self.num_classes = 10 if self.dataset == 'cifar10' else 100
 
-        # Training parameters
         self.batch_size = 64
         self.num_epochs = 100
-        self.learning_rate = 0.1     # SGD initial LR for ResNet
-        self.momentum = 0.9
-        self.weight_decay = 5e-4
+        self.learning_rate = 3e-4   # AdamW LR (same as ViT)
+        self.weight_decay = 0.03    # AdamW weight decay (same as ViT)
+        self.warmup_epochs = 5      # Warmup epochs (same as ViT)
 
         # Learning rate milestones for MultiStepLR
         self.lr_milestones = [60, 90, 120]
