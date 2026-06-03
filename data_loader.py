@@ -64,7 +64,8 @@ class KorniaAugmentationPipeline:
     """GPU-accelerated augmentation pipeline using Kornia."""
     
     def __init__(self, use_flip_crop=True, randaug_enabled=False, randaug_n=2,
-                 randaug_m=9, use_cutout=False, device='cuda'):
+                 randaug_m=9, use_cutout=False, device='cuda',
+                 normalize_mean=None, normalize_std=None):
         self.device = device
         if not KORNIA_AVAILABLE:
             raise ImportError("Kornia required. pip install kornia")
@@ -81,11 +82,18 @@ class KorniaAugmentationPipeline:
         else:
             self.erasing = None
         
+        # Normalize to be applied AFTER all augmentations (operates on [0,1] then normalizes)
+        self.do_normalize = normalize_mean is not None and normalize_std is not None
+        if self.do_normalize:
+            self.normalize = K.Normalize(mean=normalize_mean, std=normalize_std)
+        
         self.flip_aug = self.flip_aug.to(device)
         if self.randaug:
             self.randaug = self.randaug.to(device)
         if self.erasing:
             self.erasing = self.erasing.to(device)
+        if self.do_normalize:
+            self.normalize = self.normalize.to(device)
     
     def random_crop_with_padding(self, batch_imgs, padding=4):
         b, c, h, w = batch_imgs.shape
@@ -96,22 +104,39 @@ class KorniaAugmentationPipeline:
         return batch_imgs[:, :, top:top+crop_size, left:left+crop_size]
     
     def __call__(self, batch_imgs, batch_labels=None):
+        print(f"Augmentation pipeline received batch of shape {batch_imgs.shape} and dtype {batch_imgs.dtype}")
         batch_imgs = batch_imgs.to(self.device)
+        type_dtype = batch_imgs.dtype
+        if batch_imgs.dtype != torch.float32:
+            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 1")
+            batch_imgs = batch_imgs.float()
+        # Augmentations operate on [0,1] range
         batch_imgs = self.random_crop_with_padding(batch_imgs, padding=4)
         batch_imgs = self.flip_aug(batch_imgs)
-
+        if batch_imgs.dtype != torch.float32:
+            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 2")
+            batch_imgs = batch_imgs.float()
         if self.randaug:
             batch_imgs = self.randaug(batch_imgs)
-
+        if batch_imgs.dtype != torch.float32:
+            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 3")
+            batch_imgs = batch_imgs.float()
         if self.erasing:
-            type = batch_imgs.dtype
-            if batch_imgs.dtype != torch.float32:
-                print(f"Converting from {batch_imgs} to float32")
-                batch_imgs = batch_imgs.float()
             batch_imgs = self.erasing(batch_imgs)
-            batch_imgs = batch_imgs.to(type)
+        if batch_imgs.dtype != torch.float32:
+            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 4")
+            batch_imgs = batch_imgs.float()
+        # Normalize AFTER all augmentations (converts [0,1] to standardized range)
+        if self.do_normalize:
+            batch_imgs = self.normalize(batch_imgs)
+        if batch_imgs.dtype != torch.float32:
+            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 5")
+            batch_imgs = batch_imgs.float()
         if batch_labels is not None:
             return batch_imgs, batch_labels
+        if batch_imgs.dtype != torch.float32:
+            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 6")
+            batch_imgs = batch_imgs.float()
         return batch_imgs
 
 
@@ -226,10 +251,15 @@ class KorniaDatasetWrapper(torch.utils.data.Dataset):
         return img, label
     
     def kornia_collate_fn(self, batch):
+        print(f"Collate_fn received batch of size {len(batch)} and type {type(batch)}")
+        print(f"First item in batch: {batch[0][0].shape}, dtype {batch[0][0].dtype}, label {batch[0][1]}")
         imgs, labels = zip(*batch)
         imgs = torch.stack(imgs)
         labels = torch.tensor(labels)
         imgs, labels = self.kornia_pipeline(imgs, labels)
+        if imgs.dtype != torch.float32:
+            print(f"transfer {imgs.dtype} to float32 for collate_fn output")
+            imgs = imgs.to(torch.float32)
         return imgs, labels
 
 
@@ -252,8 +282,7 @@ def get_dataloaders_with_kornia(dataset='cifar10', batch_size=64, num_workers=0,
         std = [0.2675, 0.2565, 0.2761]
     
     base_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std)
+        transforms.ToTensor(),  # Only ToTensor — no Normalize! Augmentations need [0,1] range
     ])
     
     if dataset == 'cifar10':
@@ -263,13 +292,20 @@ def get_dataloaders_with_kornia(dataset='cifar10', batch_size=64, num_workers=0,
     else:
         raise ValueError(f"Invalid dataset: {dataset}")
     
+    # Test set uses full transform (ToTensor + Normalize, no augmentations)
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+    
     train_dataset = DatasetClass(root=data_dir, train=True, download=False, transform=base_transform)
-    test_dataset = DatasetClass(root=data_dir, train=False, download=False, transform=base_transform)
+    test_dataset = DatasetClass(root=data_dir, train=False, download=False, transform=test_transform)
     
     kornia_pipeline = KorniaAugmentationPipeline(
         use_flip_crop=True, randaug_enabled=randaug_enabled,
         randaug_n=randaug_n, randaug_m=randaug_m,
-        use_cutout=use_cutout, device=device
+        use_cutout=use_cutout, device=device,
+        normalize_mean=mean, normalize_std=std  # Normalize applied AFTER augmentations
     )
     
     kornia_wrapper = KorniaDatasetWrapper(train_dataset, kornia_pipeline)
