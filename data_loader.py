@@ -12,7 +12,6 @@ try:
     import kornia
     import kornia.augmentation as K
     import kornia.augmentation.auto as auto
-    import kornia.augmentation.auto as auto
     KORNIA_AVAILABLE = True
 except ImportError:
     KORNIA_AVAILABLE = False
@@ -105,8 +104,8 @@ class KorniaAugmentationPipeline:
             batch_imgs = self.randaug(batch_imgs)
 
         if self.erasing:
+            type = batch_imgs.dtype
             if batch_imgs.dtype != torch.float32:
-                type = batch_imgs.dtype
                 print(f"Converting from {batch_imgs} to float32")
                 batch_imgs = batch_imgs.float()
             batch_imgs = self.erasing(batch_imgs)
