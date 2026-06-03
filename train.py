@@ -322,7 +322,7 @@ class ResNetTrainer:
                 images, labels = self.mixup(images, labels)
                 mixup_applied = True
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast("cuda",enabled=self.use_amp if torch.cuda.is_available() and str(self.device) != 'cpu' else False):
                 outputs = self.model(images)
                 if mixup_applied:
                     loss = F.kl_div(F.log_softmax(outputs, dim=1), labels, reduction='batchmean')
