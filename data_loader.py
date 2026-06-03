@@ -9,7 +9,10 @@ import random
 
 # Optional Kornia import for GPU augmentations
 try:
+    import kornia
     import kornia.augmentation as K
+    import kornia.augmentation.auto as auto
+    import kornia.augmentation.auto as auto
     KORNIA_AVAILABLE = True
 except ImportError:
     KORNIA_AVAILABLE = False
@@ -70,7 +73,7 @@ class KorniaAugmentationPipeline:
         self.flip_aug = K.RandomHorizontalFlip(same_on_batch=False, p=0.5)
         
         if randaug_enabled:
-            self.randaug = K.auto.RandAugment(n=randaug_n, m=randaug_m)
+            self.randaug = auto.RandAugment(n=randaug_n, m=randaug_m)
         else:
             self.randaug = None
         
@@ -97,10 +100,17 @@ class KorniaAugmentationPipeline:
         batch_imgs = batch_imgs.to(self.device)
         batch_imgs = self.random_crop_with_padding(batch_imgs, padding=4)
         batch_imgs = self.flip_aug(batch_imgs)
+
         if self.randaug:
             batch_imgs = self.randaug(batch_imgs)
+
         if self.erasing:
+            if batch_imgs.dtype != torch.float32:
+                type = batch_imgs.dtype
+                print(f"Converting from {batch_imgs} to float32")
+                batch_imgs = batch_imgs.float()
             batch_imgs = self.erasing(batch_imgs)
+            batch_imgs = batch_imgs.to(type)
         if batch_labels is not None:
             return batch_imgs, batch_labels
         return batch_imgs
@@ -199,10 +209,39 @@ def get_dataloaders(dataset='cifar10', batch_size=64, num_workers=4, data_dir='.
     return train_loader, test_loader
 
 
-def get_dataloaders_with_kornia(dataset='cifar10', batch_size=64, num_workers=4,
+class KorniaDatasetWrapper(torch.utils.data.Dataset):
+    """Dataset wrapper that applies Kornia augmentations via collate function.
+    
+    The collate_fn as a bound method is pickleable (unlike closures),
+    making it compatible with Windows multiprocessing.
+    """
+    def __init__(self, dataset, kornia_pipeline):
+        self.dataset = dataset
+        self.kornia_pipeline = kornia_pipeline
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        img, label = self.dataset[idx]
+        return img, label
+    
+    def kornia_collate_fn(self, batch):
+        imgs, labels = zip(*batch)
+        imgs = torch.stack(imgs)
+        labels = torch.tensor(labels)
+        imgs, labels = self.kornia_pipeline(imgs, labels)
+        return imgs, labels
+
+
+def get_dataloaders_with_kornia(dataset='cifar10', batch_size=64, num_workers=0,
                                  data_dir='./data', randaug_enabled=False, randaug_n=2,
                                  randaug_m=9, use_cutout=False, device='cuda', **kwargs):
-    """Get data loaders with GPU-based Kornia augmentations."""
+    """Get data loaders with GPU-based Kornia augmentations.
+    
+    Note: num_workers must be 0 when using GPU augmentations, since
+    the collate_fn runs on the main process to access CUDA.
+    """
     if not KORNIA_AVAILABLE:
         raise ImportError("Kornia required. pip install kornia")
     
@@ -234,22 +273,16 @@ def get_dataloaders_with_kornia(dataset='cifar10', batch_size=64, num_workers=4,
         use_cutout=use_cutout, device=device
     )
     
-    def _kornia_collate(batch, pipeline=kornia_pipeline):
-        imgs, labels = zip(*batch)
-        imgs = torch.stack(imgs)
-        labels = torch.tensor(labels)
-        imgs, labels = pipeline(imgs, labels)
-        return imgs, labels
+    kornia_wrapper = KorniaDatasetWrapper(train_dataset, kornia_pipeline)
     
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, persistent_workers=num_workers > 0,
-        pin_memory=True, collate_fn=_kornia_collate
+        kornia_wrapper, batch_size=batch_size, shuffle=True,
+        num_workers=0, pin_memory=False,
+        collate_fn=kornia_wrapper.kornia_collate_fn
     )
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, persistent_workers=num_workers > 0,
-        pin_memory=True
+        num_workers=0, pin_memory=False
     )
     return train_loader, test_loader
 
