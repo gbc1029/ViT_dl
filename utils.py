@@ -54,7 +54,7 @@ def setup_logger(name='ViT-Trainer', level=logging.INFO, log_to_file=True, log_d
             handler.close()
             logger.removeHandler(handler)
     
-    logger.setLevel(level)
+    logger.setLevel(logging.DEBUG)
     
     # Use a simpler formatter without timestamps for better readability
     # (timestamps will be added by the handlers)
@@ -86,7 +86,7 @@ def setup_logger(name='ViT-Trainer', level=logging.INFO, log_to_file=True, log_d
         
         # Use custom handler that flushes immediately
         file_handler = ImmediateFileHandler(log_path, mode='a', encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)  # File gets ALL logs
+        file_handler.setLevel(logging.DEBUG if level <= logging.DEBUG else logging.INFO)  # File gets ALL logs
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         

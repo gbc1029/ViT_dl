@@ -848,7 +848,7 @@ class Trainer:
                 
                 # Apply AMP autocast (optional)
                 if self.use_amp:
-                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    with torch.amp.autocast(device_type="cuda",enabled=self.use_amp):
                         outputs = self.model(images)
                         loss = self.criterion(outputs, labels)
                 else:
@@ -1135,13 +1135,7 @@ if __name__ == "__main__":
     sys.stdout.flush()
         
     args = parse_args()
-    config = Config()
-    
-    # Quick args sync
-    config.mode = args.mode or config.mode
-    config.model_size = args.model_size or config.model_size
-    config.num_epochs = args.epochs or config.num_epochs
-    config.batch_size = args.batch_size or config.batch_size
+    config = Config.from_args(args)
     
     # Initialize logging BEFORE creating trainer
     force_new_log = (config.mode != 'resume')

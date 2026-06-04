@@ -7,15 +7,19 @@ import torchvision.transforms.functional as F
 from torchvision.datasets import CIFAR10, CIFAR100
 import numpy as np
 import random
+from utils import _log_error,_log_warning
+
 
 # Optional Kornia import for GPU augmentations
 try:
     import kornia.augmentation as K
+    import kornia.augmentation.auto as auto
     # RandAugment is in kornia.augmentation, not augmentation.auto
     KORNIA_AVAILABLE = True
 except ImportError:
     KORNIA_AVAILABLE = False
     print("Warning: Kornia not available. Falling back to torchvision transforms.")
+    _log_warning("Warning: Kornia not available. Falling back to torchvision transforms.")
 
 
 class Cutout(object):
@@ -111,7 +115,9 @@ class KorniaAugmentationPipeline:
                  randaug_n=2,
                  randaug_m=9,
                  use_cutout=False,
-                 device='cuda'):
+                 device='cuda',
+                 normalize_mean=None,
+                 normalize_std=None):
         
         self.device = device
         self.use_flip_crop = use_flip_crop
@@ -133,23 +139,35 @@ class KorniaAugmentationPipeline:
         else:
             self.randaug = None
         
-        # RandomErasing (Cutout)
-        if use_cutout:
-            self.erasing = K.RandomErasing(
-                p=0.5,
-                scale=(0.02, 0.15),
-                ratio=(0.3, 3.3),
-                same_on_batch=False
-            )
+        # RandomErasing (Cutout) — manual GPU impl (kornia 0.8.3 RandomErasing incompatible with PT 2.12)
+        self.use_cutout = use_cutout
+        self.erase_available = False
+        try:
+            if use_cutout:
+                self.erasing = K.RandomErasing(
+                    p=0.5,
+                    scale=(0.02, 0.15),
+                    ratio=(0.3, 3.3),
+                    same_on_batch=False
+                )
+                self.erase_available = True
+            else:
+                self.erasing = None
+        except:
+            self.erase_available = False
+            _log_error("RandomErasing incompatible,fall to manual_cutout")
+        
+        # Normalize applied AFTER all augmentations (not before, to keep [0,1] for RandAugment)
+        if normalize_mean is not None and normalize_std is not None:
+            self.do_normalize = True
+            self.normalize = K.Normalize(mean=normalize_mean, std=normalize_std).to(device)
         else:
-            self.erasing = None
+            self.do_normalize = False
         
         # Move to device
         self.flip_aug = self.flip_aug.to(device)
         if self.randaug:
             self.randaug = self.randaug.to(device)
-        if self.erasing:
-            self.erasing = self.erasing.to(device)
     
     def random_crop_with_padding(self, batch_imgs, padding=4):
         """Apply random crop with padding (simulates torchvision's RandomCrop)."""
@@ -184,13 +202,41 @@ class KorniaAugmentationPipeline:
         if self.randaug:
             batch_imgs = self.randaug(batch_imgs)
         
-        # RandomErasing (Cutout)
-        if self.erasing:
-            batch_imgs = self.erasing(batch_imgs)
+        # Manual GPU Cutout (replaces kornia RandomErasing for PyTorch 2.12 compatibility)
+        if self.use_cutout:
+            try:
+                if self.erase_available:
+                    if self.erasing:
+                        batch_imgs = self.erasing(batch_imgs)
+                else:
+                    batch_imgs = self._manual_cutout(batch_imgs)
+            except:
+                _log_error("RandomErasing incompatible,fall to manual_cutout")
+                self.erase_available = False
+                batch_imgs = self._manual_cutout(batch_imgs)
+        
+        # Normalize AFTER all augmentations (converts [0,1] to standardized range)
+        if self.do_normalize:
+            batch_imgs = self.normalize(batch_imgs)
         
         if batch_labels is not None:
             return batch_imgs, batch_labels
         return batch_imgs
+    
+    def _manual_cutout(self, batch_imgs):
+        """Manual GPU Cutout implementation (avoids kornia RandomErasing PyTorch 2.12 bug)."""
+        b, c, h, w = batch_imgs.shape
+        mask = torch.ones(b, h, w, device=self.device, dtype=batch_imgs.dtype)
+        for i in range(b):
+            if torch.rand(1).item() < 0.5:  # p=0.5
+                y = torch.randint(h, (1,)).item()
+                x = torch.randint(w, (1,)).item()
+                y1 = max(0, y - 8)
+                y2 = min(h, y + 8)
+                x1 = max(0, x - 8)
+                x2 = min(w, x + 8)
+                mask[i, y1:y2, x1:x2] = 0
+        return batch_imgs * mask.unsqueeze(1)
 
 def get_train_transform(dataset='cifar10', randaug_enabled=False, randaug_n=2, randaug_m=9,
                         use_cutout=False, cutout_length=16, use_color_jitter=False,
@@ -422,10 +468,9 @@ def get_dataloaders_with_kornia(
         mean = [0.5071, 0.4867, 0.4408]
         std = [0.2675, 0.2565, 0.2761]
     
-    # CPU preprocessing only (ToTensor + Normalize)
+    # CPU preprocessing only (ToTensor, NO Normalize - augmentations need [0,1] range)
     train_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean, std)
     ])
     
     test_transform = transforms.Compose([
@@ -443,14 +488,16 @@ def get_dataloaders_with_kornia(
     else:
         raise ValueError(f"Invalid dataset: {dataset}")
     
-    # Create Kornia augmentation pipeline
+    # Create Kornia augmentation pipeline (with post-augmentation normalize)
     kornia_pipeline = KorniaAugmentationPipeline(
         use_flip_crop=True,
         randaug_enabled=randaug_enabled,
         randaug_n=randaug_n,
         randaug_m=randaug_m,
         use_cutout=use_cutout,
-        device=device
+        device=device,
+        normalize_mean=mean,
+        normalize_std=std
     )
     
     kornia_wrapper = KorniaDatasetWrapper(train_dataset, kornia_pipeline)

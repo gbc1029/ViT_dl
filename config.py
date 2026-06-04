@@ -116,6 +116,78 @@ class Config:
         self._set_model_params()
         self._set_num_classes()
     
+    @classmethod
+    def from_args(cls, args):
+        """Create Config from argparse.Namespace, applying all non-None values.
+        
+        Args:
+            args: argparse.Namespace from parse_args()
+            
+        Returns:
+            Config instance with CLI overrides applied
+        """
+        config = cls()
+        
+        # args-to-config mapping (arg_name: config_attr)
+        # Standard params
+        for attr in ['mode', 'dataset', 'epochs', 'batch_size', 'lr',
+                      'warmup_epochs', 'weight_decay', 'label_smoothing',
+                      'amp', 'ema_decay', 'grad_clip',
+                      'randaug_n', 'randaug_m', 'cutout_length',
+                      'color_jitter_brightness', 'color_jitter_contrast',
+                      'color_jitter_saturation', 'color_jitter_hue',
+                      'rotation_degrees', 'affine_translate',
+                      'mixup_alpha', 'mixup_prob', 'drop_path']:
+            val = getattr(args, attr, None)
+            if val is not None:
+                # Handle attr name mismatches: args attr -> config attr
+                if attr == 'epochs':
+                    setattr(config, 'num_epochs', val)
+                elif attr == 'lr':
+                    setattr(config, 'learning_rate', val)
+                elif attr == 'amp':
+                    setattr(config, 'use_amp', val)
+                elif attr == 'drop_path':
+                    setattr(config, 'drop_path_rate', val)
+                else:
+                    setattr(config, attr, val)
+        
+        # Boolean flags (action='store_true')
+        for flag in ['randaug', 'cutout', 'color_jitter', 'rotation', 'affine',
+                      'mixup', 'verbose', 'debug', 'kornia']:
+            val = getattr(args, flag, None)
+            if val is not None:
+                if flag == 'randaug':
+                    setattr(config, 'randaug_enabled', val)
+                elif flag == 'rotation':
+                    setattr(config, 'use_random_rotation', val)
+                elif flag == 'affine':
+                    setattr(config, 'use_random_affine', val)
+                elif flag == 'kornia':
+                    setattr(config, 'use_kornia', val)
+                elif flag == 'cutout':
+                    setattr(config, 'use_cutout', val)
+                elif flag == 'color_jitter':
+                    setattr(config, 'use_color_jitter', val)
+                elif flag == 'mixup':
+                    setattr(config, 'use_mixup', val)
+                else:
+                    setattr(config, flag, val)
+        
+        # model_size needs special handling (re-triggers model param setup)
+        model_size = getattr(args, 'model_size', None)
+        if model_size is not None:
+            config.model_size = model_size
+            config._set_model_params()
+        
+        # checkpoint path
+        ckpt = getattr(args, 'checkpoint', None)
+        if ckpt is not None:
+            config.checkpoint_path = ckpt
+        
+        config._set_num_classes()
+        return config
+    
     def to_dict(self):
         """Convert to dictionary."""
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
