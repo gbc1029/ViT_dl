@@ -1,10 +1,20 @@
 """Configuration for ViT on CIFAR-10/CIFAR-100"""
 
 class Config:
-    def __init__(self):
+    def __init__(self,model_type = 'vit',dataset = 'cifar10',model_size = 'small'):
         # Dataset selection
-        self.dataset = 'cifar10'
-        self.model_size = 'small'
+        self.dataset = dataset
+        self.model_size = model_size
+        self.model_type = model_type
+        #固定hybrid参数
+        self.hybrid_cnn_stem = 64
+        self.hybrid_cnn_stage1_blocks = 2
+        self.hybrid_cnn_stage2_blocks = 2   # 含 down
+        self.hybrid_cnn_stage3_blocks = 2   # 含 down
+        self.hybrid_vit_dim = 384
+        self.hybrid_vit_depth = 4
+        self.hybrid_vit_heads = 6
+        self.hybrid_vit_mlp_ratio = 4       # mlp_dim = dim * ratio
         
         # 动态设置模型参数
         self._set_model_params()
@@ -130,7 +140,7 @@ class Config:
         
         # args-to-config mapping (arg_name: config_attr)
         # Standard params
-        for attr in ['mode', 'dataset', 'epochs', 'batch_size', 'lr',
+        for attr in ['mode', 'model_type','dataset', 'epochs', 'batch_size', 'lr',
                       'warmup_epochs', 'weight_decay', 'label_smoothing',
                       'amp', 'ema_decay', 'grad_clip',
                       'randaug_n', 'randaug_m', 'cutout_length',
@@ -185,6 +195,15 @@ class Config:
         if ckpt is not None:
             config.checkpoint_path = ckpt
         
+        config.hybrid_cnn_stem = 64
+        config.hybrid_cnn_stage1_blocks = 2
+        config.hybrid_cnn_stage2_blocks = 2   # 含 down
+        config.hybrid_cnn_stage3_blocks = 2   # 含 down
+        config.hybrid_vit_dim = 384
+        config.hybrid_vit_depth = 4
+        config.hybrid_vit_heads = 6
+        config.hybrid_vit_mlp_ratio = 4       # mlp_dim = dim * ratio
+
         config._set_num_classes()
         return config
     

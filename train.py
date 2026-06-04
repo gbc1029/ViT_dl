@@ -1,4 +1,13 @@
 """Training script for Vision Transformer on CIFAR-10 with multiple modes"""
+
+"""
+example
+python train.py'
+ --mode train --dataset cifar100 --model-type hybrid '
+ --epochs 100 --batch-size 64 --lr 3e-4 '
+ --weight-decay 0.05 --warmup-epochs 5 '
+ --randaug --mixup --drop-path 0.1
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +21,7 @@ from glob import glob
 from data_loader import get_dataloaders, get_dataloaders_with_kornia,KorniaDatasetWrapper,MixUp, KorniaAugmentationPipeline
 import numpy as np
 import random
-from model import VisionTransformer
+from model import VisionTransformer,HybridVisionTransformer
 from config import Config
 from utils import plot_results, count_parameters, visualize_patches
 from utils import _log_info, _log_debug, _log_warning, _log_error, init_logging, get_logger
@@ -44,8 +53,12 @@ def get_dataset_code(dataset):
 
 def get_checkpoint_dir(config):
     """Get checkpoint directory based on model type."""
-    return 'checkpoints/vit'
-
+    if hasattr(config, 'model_type'):
+        return f"checkpoints/{config.model_type}"
+    else:
+        #fallback直接在主目录下保存
+        _log_error("cannot get model_type,save to main catalogue")
+        return 'checkpoints'
 
 def save_checkpoint(model, optimizer, scheduler, history, config, filename_prefix='', scaler=None):
     """Save model checkpoint with timestamp."""
@@ -411,18 +424,39 @@ class Trainer:
         _log_info(f"  depth: {self.config.depth}")
         _log_info(f"  heads: {self.config.heads}")
         
-        self.model = VisionTransformer(
-            img_size=config.image_size,
-            patch_size=config.patch_size,
-            num_classes=config.num_classes,
-            dim=config.dim,
-            depth=config.depth,
-            heads=config.heads,
-            mlp_dim=config.mlp_dim,
-            dropout=config.dropout,
-            emb_dropout=config.emb_dropout,
-            drop_path_rate=getattr(config, 'drop_path_rate', 0.0)
-        ).to(self.device)
+        if config.model_type == 'vit':
+            _log_info("use vit model")
+            self.model = VisionTransformer(
+                img_size=config.image_size,
+                patch_size=config.patch_size,
+                num_classes=config.num_classes,
+                dim=config.dim,
+                depth=config.depth,
+                heads=config.heads,
+                mlp_dim=config.mlp_dim,
+                dropout=config.dropout,
+                emb_dropout=config.emb_dropout,
+                drop_path_rate=getattr(config, 'drop_path_rate', 0.0)
+            ).to(self.device)
+        elif config.model_type == 'hybrid':
+            _log_info("use hybrid model")
+            # 从 config 中读取混合模型的参数
+            self.model = HybridVisionTransformer(
+                num_classes=config.num_classes,
+                cnn_stem_channels=getattr(config, 'hybrid_cnn_stem', 64),
+                cnn_stage1_blocks=getattr(config, 'hybrid_cnn_stage1_blocks', 2),
+                cnn_stage2_blocks=getattr(config, 'hybrid_cnn_stage2_blocks', 2),
+                cnn_stage3_blocks=getattr(config, 'hybrid_cnn_stage3_blocks', 2),
+                vit_dim=getattr(config, 'hybrid_vit_dim', 384),
+                vit_depth=getattr(config, 'hybrid_vit_depth', 4),
+                vit_heads=getattr(config, 'hybrid_vit_heads', 6),
+                vit_mlp_ratio=getattr(config, 'hybrid_vit_mlp_ratio', 4),
+                dropout=config.dropout,
+                emb_dropout=config.emb_dropout,
+                drop_path_rate=getattr(config, 'drop_path_rate', 0.0)
+            ).to(self.device)
+        else:
+            raise ValueError(f"Unknown model_type: {config.model_type}")
         
         # Data loaders (using restored config values)
         _log_info(f"Creating data loaders for {config.dataset} with batch_size={self.config.batch_size}")
@@ -1038,6 +1072,8 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='train', 
                        choices=['dry_run', 'train', 'test', 'resume'],
                        help='Training mode: dry_run, train, test, resume')
+    parser.add_argument('--model-type', type=str, default='vit', choices=['vit', 'hybrid'],
+                    help='Model architecture: vit or hybrid')
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Path to checkpoint for test or resume mode')
     parser.add_argument('--epochs', type=int, default=None,

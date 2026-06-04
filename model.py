@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 class StochasticDepth(nn.Module):
     """Stochastic Depth (DropPath) regularization.
@@ -228,6 +228,136 @@ class VisionTransformer(nn.Module):
         
         return self.classifier(cls_token)
 
+class BasicBlock(nn.Module):
+    """ResNet BasicBlock 用于 CNN 部分"""
+    expansion = 1
+    def __init__(self, in_planes, planes, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, 3, stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, 3, 1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, 1, stride, bias=False),
+                nn.BatchNorm2d(planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+class HybridVisionTransformer(nn.Module):
+    """CNN (ResNet) + ViT 混合模型"""
+    def __init__(
+        self,
+        num_classes=100,
+        # CNN 参数
+        cnn_stem_channels=64,
+        cnn_stage1_blocks=2,
+        cnn_stage2_blocks=2,
+        cnn_stage3_blocks=2,
+        # ViT 参数
+        vit_dim=384,
+        vit_depth=4,
+        vit_heads=6,
+        vit_mlp_ratio=4,
+        dropout=0.1,
+        emb_dropout=0.1,
+        drop_path_rate=0.0
+    ):
+        super().__init__()
+        # ---------- CNN 部分 ----------
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, cnn_stem_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(cnn_stem_channels),
+            nn.ReLU()
+        )
+        # Stage1 (stride=1)
+        self.layer1 = self._make_layer(cnn_stem_channels, cnn_stem_channels, cnn_stage1_blocks, stride=1)
+        # Stage2 (downsample)
+        self.layer2 = self._make_layer(cnn_stem_channels, cnn_stem_channels*2, cnn_stage2_blocks, stride=2)
+        # Stage3 (downsample)
+        self.layer3 = self._make_layer(cnn_stem_channels*2, cnn_stem_channels*4, cnn_stage3_blocks, stride=2)
+        # 最终 CNN 输出通道 = cnn_stem_channels * 4
+        cnn_out_channels = cnn_stem_channels * 4  # 64*4=256
+        # 特征图尺寸: 32/4 = 8
+        num_patches = 8 * 8
+
+        # ---------- ViT 部分 ----------
+        # 将 CNN 输出的 2D 特征映射到 Transformer 维度
+        self.patch_linear = nn.Linear(cnn_out_channels, vit_dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, vit_dim))
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, vit_dim))
+        self.dropout = nn.Dropout(emb_dropout)
+
+        # Transformer blocks
+        mlp_dim = int(vit_dim * vit_mlp_ratio)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, vit_depth)]  # 线性递增
+        self.blocks = nn.ModuleList([
+            TransformerBlock(vit_dim, vit_heads, mlp_dim, dropout, drop_path_rate=dpr[i])
+            for i in range(vit_depth)
+        ])
+        self.norm = nn.LayerNorm(vit_dim)
+        self.classifier = nn.Linear(vit_dim, num_classes)
+
+        self._init_weights()
+
+    def _make_layer(self, in_planes, out_planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(BasicBlock(in_planes, out_planes, s))
+            in_planes = out_planes
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        # 与原始 ViT 相同的初始化
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):
+        # CNN 前向
+        x = self.stem(x)           # 32x32
+        x = self.layer1(x)         # 32x32
+        x = self.layer2(x)         # 16x16
+        x = self.layer3(x)         # 8x8, channels = 256
+
+        B, C, H, W = x.shape
+        # 展平并转换维度
+        x = x.flatten(2).transpose(1, 2)   # (B, H*W, C)
+        x = self.patch_linear(x)           # (B, 64, vit_dim)
+
+        # 添加 CLS token 和位置编码
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)  # (B, 65, D)
+        x = x + self.pos_embed
+        x = self.dropout(x)
+
+        # Transformer
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        cls_out = x[:, 0]
+        return self.classifier(cls_out)
 
 if __name__ == "__main__":
     # Test the model with different sizes
