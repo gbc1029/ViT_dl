@@ -6,6 +6,7 @@ import torchvision.transforms as transforms
 from torchvision.datasets import CIFAR10, CIFAR100
 import numpy as np
 import random
+from utils import _log_warning,_log_error
 
 # Optional Kornia import for GPU augmentations
 try:
@@ -77,10 +78,22 @@ class KorniaAugmentationPipeline:
         else:
             self.randaug = None
         
-        if use_cutout:
-            self.erasing = K.RandomErasing(p=0.5, scale=(0.02, 0.15), ratio=(0.3, 3.3), same_on_batch=False)
-        else:
-            self.erasing = None
+        self.use_cutout = use_cutout
+        self.erase_available = False
+        try:
+            if use_cutout:
+                self.erasing = K.RandomErasing(
+                    p=0.5,
+                    scale=(0.02, 0.15),
+                    ratio=(0.3, 3.3),
+                    same_on_batch=False
+                )
+                self.erase_available = True
+            else:
+                self.erasing = None
+        except:
+            self.erase_available = False
+            _log_error("RandomErasing incompatible,fall to manual_cutout")
         
         # Normalize to be applied AFTER all augmentations (operates on [0,1] then normalizes)
         self.do_normalize = normalize_mean is not None and normalize_std is not None
@@ -104,41 +117,63 @@ class KorniaAugmentationPipeline:
         return batch_imgs[:, :, top:top+crop_size, left:left+crop_size]
     
     def __call__(self, batch_imgs, batch_labels=None):
-        print(f"Augmentation pipeline received batch of shape {batch_imgs.shape} and dtype {batch_imgs.dtype}")
+        #print(f"Augmentation pipeline received batch of shape {batch_imgs.shape} and dtype {batch_imgs.dtype}")
         batch_imgs = batch_imgs.to(self.device)
         type_dtype = batch_imgs.dtype
         if batch_imgs.dtype != torch.float32:
-            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 1")
+            #print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 1")
             batch_imgs = batch_imgs.float()
         # Augmentations operate on [0,1] range
         batch_imgs = self.random_crop_with_padding(batch_imgs, padding=4)
         batch_imgs = self.flip_aug(batch_imgs)
-        if batch_imgs.dtype != torch.float32:
-            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 2")
-            batch_imgs = batch_imgs.float()
+        #if batch_imgs.dtype != torch.float32:
+            #print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 2")
+            #batch_imgs = batch_imgs.float()
         if self.randaug:
             batch_imgs = self.randaug(batch_imgs)
-        if batch_imgs.dtype != torch.float32:
-            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 3")
-            batch_imgs = batch_imgs.float()
-        if self.erasing:
-            batch_imgs = self.erasing(batch_imgs)
-        if batch_imgs.dtype != torch.float32:
-            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 4")
-            batch_imgs = batch_imgs.float()
+        #if batch_imgs.dtype != torch.float32:
+            #print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 3")
+            #batch_imgs = batch_imgs.float()
+        if self.use_cutout:
+            try:
+                if self.erase_available:
+                    if self.erasing:
+                        batch_imgs = self.erasing(batch_imgs)
+                else:
+                    batch_imgs = self._manual_cutout(batch_imgs)
+            except:
+                _log_error("RandomErasing incompatible,fall to manual_cutout")
+                self.erase_available = False
+                batch_imgs = self._manual_cutout(batch_imgs)
+        #if batch_imgs.dtype != torch.float32:
+            #print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 4")
+            #batch_imgs = batch_imgs.float()
         # Normalize AFTER all augmentations (converts [0,1] to standardized range)
         if self.do_normalize:
             batch_imgs = self.normalize(batch_imgs)
-        if batch_imgs.dtype != torch.float32:
-            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 5")
-            batch_imgs = batch_imgs.float()
+        #if batch_imgs.dtype != torch.float32:
+            #print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 5")
+            #batch_imgs = batch_imgs.float()
         if batch_labels is not None:
             return batch_imgs, batch_labels
-        if batch_imgs.dtype != torch.float32:
-            print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 6")
-            batch_imgs = batch_imgs.float()
+        #if batch_imgs.dtype != torch.float32:
+            #print(f"transfer {batch_imgs.dtype} to float32 for augmentations at pos 6")
+            #batch_imgs = batch_imgs.float()
         return batch_imgs
-
+    def _manual_cutout(self, batch_imgs):
+        """Manual GPU Cutout implementation (avoids kornia RandomErasing PyTorch 2.12 bug)."""
+        b, c, h, w = batch_imgs.shape
+        mask = torch.ones(b, h, w, device=self.device, dtype=batch_imgs.dtype)
+        for i in range(b):
+            if torch.rand(1).item() < 0.5:  # p=0.5
+                y = torch.randint(h, (1,)).item()
+                x = torch.randint(w, (1,)).item()
+                y1 = max(0, y - 8)
+                y2 = min(h, y + 8)
+                x1 = max(0, x - 8)
+                x2 = min(w, x + 8)
+                mask[i, y1:y2, x1:x2] = 0
+        return batch_imgs * mask.unsqueeze(1)
 
 def get_train_transform(dataset='cifar10', randaug_enabled=False, randaug_n=2, randaug_m=9,
                         use_cutout=False, cutout_length=16, use_color_jitter=False,
@@ -251,8 +286,8 @@ class KorniaDatasetWrapper(torch.utils.data.Dataset):
         return img, label
     
     def kornia_collate_fn(self, batch):
-        print(f"Collate_fn received batch of size {len(batch)} and type {type(batch)}")
-        print(f"First item in batch: {batch[0][0].shape}, dtype {batch[0][0].dtype}, label {batch[0][1]}")
+        #print(f"Collate_fn received batch of size {len(batch)} and type {type(batch)}")
+        #print(f"First item in batch: {batch[0][0].shape}, dtype {batch[0][0].dtype}, label {batch[0][1]}")
         imgs, labels = zip(*batch)
         imgs = torch.stack(imgs)
         labels = torch.tensor(labels)
