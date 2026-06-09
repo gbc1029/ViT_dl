@@ -1,10 +1,10 @@
 """Configuration for ViT on CIFAR-10/CIFAR-100"""
 
 class Config:
-    def __init__(self):
+    def __init__(self,dataset = "cifar10",model_size = 'small'):
         # Dataset selection
-        self.dataset = 'cifar10'
-        self.model_size = 'small'
+        self.dataset = dataset
+        self.model_size = model_size
         
         # 动态设置模型参数
         self._set_model_params()

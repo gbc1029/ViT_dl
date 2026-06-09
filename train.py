@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+import torch_ema
 from tqdm import tqdm
 import argparse
 import os
@@ -369,30 +370,8 @@ class Trainer:
         # based on model_size and dataset selections from cmdline or checkpoint
         _log_info(f"Recalculating model configuration...")
         
-        # Re-extract model configuration based on size
-        if config.model_size == 'tiny':
-            config.dim = 256
-            config.depth = 4
-            config.heads = 4
-            config.mlp_dim = 256
-        elif config.model_size == 'small':
-            config.dim = 512
-            config.depth = 6
-            config.heads = 8
-            config.mlp_dim = 512
-        elif config.model_size == 'base':
-            config.dim = 768
-            config.depth = 12
-            config.heads = 12
-            config.mlp_dim = 768
-        
         _log_info(f"  Model size: {config.model_size} -> dim={config.dim}, depth={config.depth}, heads={config.heads}")
         
-        # Re-set num_classes based on dataset
-        if config.dataset == 'cifar10':
-            config.num_classes = 10
-        elif config.dataset == 'cifar100':
-            config.num_classes = 100
         _log_info(f"  Dataset: {config.dataset} -> num_classes={config.num_classes}")
         
         # Save random states before creating data loaders
@@ -423,7 +402,7 @@ class Trainer:
             emb_dropout=config.emb_dropout,
             drop_path_rate=getattr(config, 'drop_path_rate', 0.0)
         ).to(self.device)
-        
+
         # Data loaders (using restored config values)
         _log_info(f"Creating data loaders for {config.dataset} with batch_size={self.config.batch_size}")
         
@@ -544,7 +523,14 @@ class Trainer:
         
         # AMP (Automatic Mixed Precision)
         self.use_amp = config.use_amp
-        
+
+        self.ema_decay = config.ema_decay
+        if config.ema_decay:
+            self.ema = torch_ema.ExponentialMovingAverage(self.model.parameters(), decay=config.ema_decay)
+            
+            print("EMA enabled")
+        else:
+            print("EMA disabled")
         # Handle new PyTorch 2.x API for GradScaler
         if hasattr(torch.amp, 'GradScaler'):
             # PyTorch 2.x new API: torch.amp.GradScaler(device_type, args...)
@@ -640,6 +626,7 @@ class Trainer:
         _log_info(f"  Weight decay: {config.weight_decay}")
         _log_info(f"  Label smoothing: {self.label_smoothing}")
         _log_info(f"  AMP: {self.use_amp}")
+        _log_info(f"  EMA: {self.ema_decay}")
         _log_info(f"  Gradient clipping: {getattr(config, 'grad_clip', 0.0)}")
         _log_info(f"  Convergence patience: {config.convergence_patience}")
         _log_info("=" * 60)
@@ -832,12 +819,14 @@ class Trainer:
         
         return avg_loss, avg_acc
     
-    def evaluate(self):
+    def evaluate(self,model = None):
         """Evaluate on test set.
         
         Note: MixUp is NOT used during evaluation (only for training).
         """
-        self.model.eval()
+        if model is None:
+            model = self.model
+        model.eval()
         test_loss = 0.0
         correct = 0
         total = 0
@@ -849,10 +838,10 @@ class Trainer:
                 # Apply AMP autocast (optional)
                 if self.use_amp:
                     with torch.amp.autocast(device_type="cuda",enabled=self.use_amp):
-                        outputs = self.model(images)
+                        outputs = model(images)
                         loss = self.criterion(outputs, labels)
                 else:
-                    outputs = self.model(images)
+                    outputs = model(images)
                     loss = self.criterion(outputs, labels)
                 
                 test_loss += loss.item()
@@ -881,6 +870,8 @@ class Trainer:
         _log_info(f"Label smoothing: {self.label_smoothing}")
         
         best_acc = 0.0
+        if self.ema:
+            ema_best_acc = 0.0
         patience_counter = 0
         
         # If resuming, start from current epoch
@@ -895,12 +886,23 @@ class Trainer:
             
             # Train
             train_loss, train_acc = self.train_epoch(epoch)
-            
+            if self.ema:
+                self.ema.update()
             # Evaluate
             test_loss, test_acc = self.evaluate()
-            
+
             _log_info(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             _log_info(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
+            if self.ema:
+                with self.ema.average_parameters():
+                    ema_loss,ema_acc = self.evaluate()
+                    _log_info(f"EMA Test Loss: {ema_loss:.4f} | EMA Test Acc: {ema_acc:.2f}%")
+                    if ema_best_acc < ema_acc:
+                        ema_best_acc = ema_acc
+                        torch.save(self.model.state_dict(), f"{self.config.model_size}_ema_model.pth")
+                        _log_info(f"new best ema acc:{ema_best_acc}")
+                    
+
             
             # Check convergence
             if self.check_convergence(epoch, test_acc):

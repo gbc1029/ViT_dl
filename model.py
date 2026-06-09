@@ -236,7 +236,7 @@ if __name__ == "__main__":
     print("Testing ViT with different model sizes:\n")
     
     for model_size in ['tiny', 'small', 'base']:
-        cfg = Config()
+        cfg = Config(model_size=model_size,dataset='cifar100')
         cfg.model_size = model_size
         
         model = VisionTransformer(
